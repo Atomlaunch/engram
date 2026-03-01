@@ -1,0 +1,22 @@
+# Database
+.engram-db/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv-memory/
+*.egg-info/
+
+# Logs
+*.log
+
+# Exported sessions (user data)
+memory/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
