@@ -180,6 +180,10 @@ def call_llm(prompt: str) -> Optional[dict]:
     mode = os.environ.get("ENGRAM_LLM_MODE") or engram_cfg.get("llm_mode", "xai")
     try:
         if mode == "openclaw":
+            # ⚠️  WARNING: openclaw mode creates a session entry in sessions.json for every
+            # LLM call. With large ingestion batches this will bloat the file (106MB+),
+            # causing 7-8 second delays on every inbound message. Use with caution.
+            # Run `python -m engram.cleanup_sessions` periodically to prune stale entries.
             return _call_openclaw(prompt)
         else:
             return _call_xai(prompt)
