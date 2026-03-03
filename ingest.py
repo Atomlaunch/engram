@@ -168,15 +168,21 @@ def chunk_text(text: str, max_chars: int = 4000) -> list[str]:
 
 
 def call_llm(prompt: str) -> Optional[dict]:
-    """Call LLM for extraction. Routes through OpenClaw gateway by default,
-    falls back to direct xAI API if ENGRAM_LLM_MODE=xai or gateway unavailable."""
+    """Call LLM for extraction.
+
+    Modes (ENGRAM_LLM_MODE env var or llm_mode in config.json):
+      xai      — calls xAI API directly (default, recommended — does not pollute OpenClaw sessions.json)
+      openclaw — routes through OpenClaw gateway (legacy; creates ephemeral session entries per call)
+
+    xAI key resolution order: XAI_API_KEY env → config.json xai_api_key → openclaw.json skills.entries.grok.apiKey
+    """
     engram_cfg = _load_engram_config()
-    mode = os.environ.get("ENGRAM_LLM_MODE") or engram_cfg.get("llm_mode", "openclaw")
+    mode = os.environ.get("ENGRAM_LLM_MODE") or engram_cfg.get("llm_mode", "xai")
     try:
-        if mode == "xai":
-            return _call_xai(prompt)
-        else:
+        if mode == "openclaw":
             return _call_openclaw(prompt)
+        else:
+            return _call_xai(prompt)
     except Exception as e:
         print(f"  ⚠️  LLM extraction failed: {e}")
         return None
@@ -265,11 +271,37 @@ def _call_openclaw(prompt: str) -> Optional[dict]:
         return parsed
 
 
+def _get_xai_key() -> str:
+    """Get xAI API key from env, then Engram config, then OpenClaw config."""
+    key = os.environ.get("XAI_API_KEY", "")
+    if key:
+        return key
+    # Try Engram config
+    engram_cfg = _load_engram_config()
+    key = engram_cfg.get("xai_api_key", "")
+    if key:
+        return key
+    # Fall back to OpenClaw config
+    try:
+        config_path = Path(os.path.expanduser("~/.openclaw/openclaw.json"))
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            # xAI key lives under skills.entries.grok.apiKey or auth profiles
+            key = cfg.get("skills", {}).get("entries", {}).get("grok", {}).get("apiKey", "")
+            if key:
+                return key
+    except Exception:
+        pass
+    raise RuntimeError("xAI API key not found. Set XAI_API_KEY env var, xai_api_key in engram/config.json, or skills.entries.grok.apiKey in openclaw.json")
+
+
 def _call_xai(prompt: str) -> Optional[dict]:
-    """Call xAI grok-3-mini directly (fallback mode)."""
+    """Call xAI grok API directly. Does NOT route through OpenClaw gateway,
+    so it won't pollute sessions.json with ephemeral session entries."""
     import urllib.request
     
-    xai_key = os.environ.get("XAI_API_KEY", "")
+    xai_key = _get_xai_key()
     if not xai_key:
         raise RuntimeError("XAI_API_KEY not set")
     

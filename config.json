@@ -1,12 +1,12 @@
 {
-  "model": "grok",
-  "llm_mode": "openclaw",
+  "model": "grok-3-mini-fast",
+  "llm_mode": "xai",
   "ingest_interval_minutes": 60,
   "max_concurrent_chunks": 5,
   "openclaw_port": null,
   "openclaw_token": null,
   "sessions_dir": "~/.openclaw/agents",
-  "memory_dir": "~/clawd/memory",
+  "memory_dir": "~/clawd/engram/exported-sessions",
   "notes": {
     "model": "Any OpenClaw model alias: grok, haiku, sonnet, qwen-local, etc.",
     "llm_mode": "openclaw (routes through gateway) or xai (direct API, needs XAI_API_KEY)",
