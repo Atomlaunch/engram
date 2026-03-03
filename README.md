@@ -55,27 +55,19 @@ HTTP server on port 3456:
 
 ## LLM Backend
 
-Engram uses `llm_mode` in `config.json` to control where LLM calls go:
+Engram uses xAI (Grok) for entity and relationship extraction.
 
-| Mode | Description | Recommended |
-|------|-------------|-------------|
-| `xai` | Direct xAI API (Grok) | ✅ Default |
-| `openclaw` | Routes through OpenClaw gateway | ⚠️ See below |
-
-**Key resolution for `xai` mode** (in priority order):
+**API key resolution** (in priority order):
 1. `XAI_API_KEY` env var
 2. `xai_api_key` in `config.json`
 3. `skills.entries.grok.apiKey` in `~/.openclaw/openclaw.json` (auto-detected if you use OpenClaw)
 
-> **⚠️ OpenClaw gateway mode warning:** If you set `llm_mode: "openclaw"`, each LLM call
-> creates a session entry in OpenClaw's `sessions.json`. Over large ingestion batches this
-> file can grow to 100MB+, causing 7-8 second delays on every inbound message. Run
-> `python cleanup_sessions.py` periodically to prune stale entries, or use `xai` mode instead.
+Override the model via `ENGRAM_MODEL` env var or `model` in `config.json` (default: `grok-3-mini-fast`).
 
 ## Requirements
 
 - Python 3.10+
-- xAI API key (or any OpenAI-compatible LLM endpoint)
+- xAI API key (get one at [x.ai](https://x.ai))
 - ~50MB disk for the graph database
 
 ## License

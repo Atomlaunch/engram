@@ -168,25 +168,13 @@ def chunk_text(text: str, max_chars: int = 4000) -> list[str]:
 
 
 def call_llm(prompt: str) -> Optional[dict]:
-    """Call LLM for extraction.
+    """Call xAI Grok API for entity/relationship extraction.
 
-    Modes (ENGRAM_LLM_MODE env var or llm_mode in config.json):
-      xai      — calls xAI API directly (default, recommended — does not pollute OpenClaw sessions.json)
-      openclaw — routes through OpenClaw gateway (legacy; creates ephemeral session entries per call)
-
-    xAI key resolution order: XAI_API_KEY env → config.json xai_api_key → openclaw.json skills.entries.grok.apiKey
+    Key resolution order: XAI_API_KEY env → config.json xai_api_key → openclaw.json skills.entries.grok.apiKey
+    Model: ENGRAM_MODEL env → config.json model → grok-3-mini-fast
     """
-    engram_cfg = _load_engram_config()
-    mode = os.environ.get("ENGRAM_LLM_MODE") or engram_cfg.get("llm_mode", "xai")
     try:
-        if mode == "openclaw":
-            # ⚠️  WARNING: openclaw mode creates a session entry in sessions.json for every
-            # LLM call. With large ingestion batches this will bloat the file (106MB+),
-            # causing 7-8 second delays on every inbound message. Use with caution.
-            # Run `python -m engram.cleanup_sessions` periodically to prune stale entries.
-            return _call_openclaw(prompt)
-        else:
-            return _call_xai(prompt)
+        return _call_xai(prompt)
     except Exception as e:
         print(f"  ⚠️  LLM extraction failed: {e}")
         return None
@@ -199,80 +187,6 @@ def _load_engram_config():
         with open(config_path) as f:
             return json.load(f)
     return {}
-
-
-def _get_openclaw_config():
-    """Read OpenClaw gateway config for chat completions endpoint."""
-    engram_cfg = _load_engram_config()
-    
-    # Port and token: engram config > openclaw.json
-    port = engram_cfg.get("openclaw_port")
-    token = engram_cfg.get("openclaw_token")
-    
-    if not port or not token:
-        config_path = Path(os.path.expanduser("~/.openclaw/openclaw.json"))
-        if not config_path.exists():
-            raise RuntimeError("~/.openclaw/openclaw.json not found")
-        with open(config_path) as f:
-            cfg = json.load(f)
-        gw = cfg.get("gateway", {})
-        port = port or gw.get("port", 18789)
-        auth = gw.get("auth", {})
-        token = token or auth.get("token", "")
-    
-    # Model: env var > engram config > default
-    model = os.environ.get("ENGRAM_MODEL") or engram_cfg.get("model", "grok")
-    return port, token, model
-
-
-def _call_openclaw(prompt: str) -> Optional[dict]:
-    """Call LLM through OpenClaw's chat completions endpoint.
-    Uses whatever model the user configures via ENGRAM_MODEL env var (default: haiku)."""
-    import urllib.request
-    
-    port, token, model = _get_openclaw_config()
-    
-    payload = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a knowledge extraction assistant. Always respond with valid JSON only, no markdown fences."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.1,
-        "max_tokens": 4096
-    })
-    
-    req = urllib.request.Request(
-        f"http://localhost:{port}/v1/chat/completions",
-        data=payload.encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Engram/1.0"
-        }
-    )
-    
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read().decode())
-        text = result["choices"][0]["message"]["content"].strip()
-        
-        # Strip thinking tags if present
-        if "<think>" in text:
-            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        
-        # Strip markdown fences
-        if text.startswith("```"):
-            text = re.sub(r'^```\w*\n', '', text)
-            text = re.sub(r'\n```$', '', text)
-        
-        parsed = json.loads(text)
-        
-        if not isinstance(parsed, dict):
-            raise ValueError("Response is not a dict")
-        if "entities" not in parsed:
-            raise ValueError("Missing 'entities' key")
-        
-        return parsed
 
 
 def _get_xai_key() -> str:
