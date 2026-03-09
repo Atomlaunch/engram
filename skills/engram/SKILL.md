@@ -19,20 +19,16 @@ Session logs → Export → Markdown → LLM Extraction → Kuzu Graph DB
 
 **Components:**
 - `engram/` — Core: ingest, query, schema, export, dedup, consolidation
-- `engram-dashboard/` — FastAPI + Sigma.js visualization (optional)
-- `extensions/engram-context-engine/` — OpenClaw plugin that injects graph facts into agent context
+- `dashboard/` — FastAPI + Sigma.js visualization (optional)
+- `extensions/context-engine/` — OpenClaw plugin for context injection
 
 ## First-Time Setup
 
-### 1. Clone and install dependencies
+### 1. Clone and install
 
 ```bash
 cd <your-openclaw-workspace>
-git clone https://github.com/Atomlaunch/engram.git engram-src
-# Copy into your workspace structure:
-cp -r engram-src/engram ./engram
-cp -r engram-src/engram-dashboard ./engram-dashboard
-cp -r engram-src/extensions/engram-context-engine ./extensions/engram-context-engine
+git clone https://github.com/Atomlaunch/engram.git engram
 ```
 
 ### 2. Python environment
@@ -43,55 +39,48 @@ source .venv-memory/bin/activate
 pip install kuzu chromadb
 ```
 
-### 3. Configure paths
+### 3. Configure
 
-Edit these files to match your setup:
+Copy the example config and fill in your values:
 
-**`engram/ingest.py`** — Set memory directories:
-```python
-MEMORY_DIR = Path(os.path.expanduser("~/your-workspace/memory"))
-
-AGENT_WORKSPACE_MEMORY_DIRS = {
-    "your-agent-name": Path(os.path.expanduser("~/.openclaw/workspace-your-agent/memory")),
-}
-```
-
-**`engram/ingest.py`** — Update `extract_agent_from_filepath()`:
-- Files in your main workspace `memory/` dir → your main agent ID
-- Files in agent workspace dirs → their respective agent IDs
-- Update the known agent names list in the function
-
-**`extensions/engram-context-engine/index.js`** — Set paths:
-```javascript
-const DEFAULTS = {
-  workspaceRoot: "/path/to/your/workspace",
-  engramDir: "/path/to/your/workspace/engram",
-  pythonBin: "/path/to/your/workspace/.venv-memory/bin/python",
-  agentsDir: "~/.openclaw/agents",
-};
-```
-
-### 4. LLM for extraction
-
-Engram uses an LLM to extract entities/facts from text. Configure via:
-
-**Option A** — Environment variable:
 ```bash
-export XAI_API_KEY="your-key"
-export ENGRAM_MODEL="grok-3-mini-fast"  # or any model
+cd engram
+cp config.example.json config.json
 ```
 
-**Option B** — Config file at `engram/config.json`:
+Edit `config.json`:
+
 ```json
 {
-  "xai_api_key": "your-key",
-  "model": "grok-3-mini-fast"
+  "model": "grok-3-mini-fast",
+  "xai_api_key": "your-xai-api-key",
+
+  "main_agent_id": "main",
+  "memory_dir": "~/your-workspace/memory",
+
+  "agent_workspaces": {
+    "agent-two": "~/.openclaw/workspace-agent-two/memory"
+  },
+
+  "ingest_workers": 6,
+
+  "context_engine": {
+    "workspace_root": "/full/path/to/your/workspace",
+    "engram_dir": "/full/path/to/your/workspace/engram",
+    "python_bin": "/full/path/to/your/workspace/.venv-memory/bin/python",
+    "agents_dir": "~/.openclaw/agents"
+  }
 }
 ```
 
-**Option C** — Auto-reads from OpenClaw config `skills.entries.grok.apiKey`
+**Key fields:**
+- `main_agent_id` — Your primary agent's ID. All files in `memory_dir` default to this.
+- `memory_dir` — Where your main agent's memory files live.
+- `agent_workspaces` — Map of additional agent IDs to their memory directories.
+- `xai_api_key` — For LLM extraction. Also reads from `XAI_API_KEY` env or OpenClaw's `skills.entries.grok.apiKey`.
+- `context_engine` — Paths for the OpenClaw plugin. Leave empty to auto-detect.
 
-### 5. Register the context engine plugin
+### 4. Register the context engine plugin
 
 Add to your OpenClaw config (`~/.openclaw/openclaw.json`):
 
@@ -100,21 +89,19 @@ Add to your OpenClaw config (`~/.openclaw/openclaw.json`):
   "plugins": {
     "allow": ["engram-context-engine"],
     "load": {
-      "paths": ["/path/to/extensions/engram-context-engine"]
+      "paths": ["/path/to/engram/extensions/context-engine"]
     },
     "slots": {
       "contextEngine": "engram-context-engine"
     },
     "entries": {
-      "engram-context-engine": {
-        "enabled": true
-      }
+      "engram-context-engine": { "enabled": true }
     },
     "installs": {
       "engram-context-engine": {
         "source": "path",
-        "sourcePath": "/path/to/extensions/engram-context-engine",
-        "installPath": "/path/to/extensions/engram-context-engine",
+        "sourcePath": "/path/to/engram/extensions/context-engine",
+        "installPath": "/path/to/engram/extensions/context-engine",
         "version": "0.1.0"
       }
     }
@@ -122,62 +109,57 @@ Add to your OpenClaw config (`~/.openclaw/openclaw.json`):
 }
 ```
 
-### 6. Initial ingest
+### 5. Initial ingest
 
 ```bash
 # Export existing sessions to markdown
 .venv-memory/bin/python engram/export_sessions.py
 
-# Run ingest (parallel, 6 workers)
+# Run ingest (parallel)
 .venv-memory/bin/python engram/ingest.py --workers 6
 ```
 
-### 7. Set up cron (hourly ingest)
+### 6. Set up cron (hourly)
 
 ```bash
 crontab -e
-# Add:
+# Add (adjust paths):
 0 */1 * * * cd /path/to/workspace && .venv-memory/bin/python engram/export_sessions.py >> /tmp/engram-export.log 2>&1 && .venv-memory/bin/python engram/engram.py ingest >> /tmp/engram-ingest.log 2>&1
 ```
 
-### 8. Dashboard (optional)
+### 7. Dashboard (optional)
 
 ```bash
-cd engram-dashboard
-npm install
-npm run bundle  # builds vendor.bundle.js
+cd engram/dashboard
+npm install && node bundle-deps.js
 pm2 start ecosystem.config.js
-# Dashboard at http://localhost:3847
+# → http://localhost:3847
 ```
 
-**Important:** Kuzu only allows one writer at a time. If running the dashboard alongside ingest cron, stop the dashboard before ingest:
-```
-pm2 delete engram-dashboard; sleep 5; <run ingest>; pm2 start ecosystem.config.js
-```
+**Note:** Kuzu allows only one writer. Stop the dashboard before running ingest cron.
 
 ## Multi-Agent Memory
 
-Each agent's facts are scoped by `agent_id` on every node. Queries return `agent_id = '<agent>' OR agent_id = 'shared'`.
+Each agent's facts are scoped by `agent_id`. Queries return facts matching `agent_id = '<agent>' OR agent_id = 'shared'`.
 
-**Agent resolution** (in `extract_agent_from_filepath()`):
-1. Files in agent workspace memory dirs → that agent's ID
-2. Files in main workspace `memory/` dir → main agent ID
-3. Filename pattern `YYYY-MM-DD-<agent>-<hash>.md` → extracted agent name
-4. Fallback → `shared` (avoid this — be explicit)
+Configure agents in `config.json`:
+- `main_agent_id` — files in `memory_dir` default to this
+- `agent_workspaces` — additional agents mapped to their memory directories
 
-**Important:** Don't let main agent files fall into `shared`. Everything in your main workspace memory dir should map to your main agent.
+Agent resolution order (in `extract_agent_from_filepath()`):
+1. File in an `agent_workspaces` directory → that agent's ID
+2. File in `memory_dir` with filename pattern `YYYY-MM-DD-<agent>-<hash>.md` matching a configured agent → that agent
+3. Any other file in `memory_dir` → `main_agent_id`
+4. Unknown location → `shared`
 
 ## Key Commands
 
 ```bash
-# Ingest with parallel workers
+# Parallel ingest
 .venv-memory/bin/python engram/ingest.py --workers 6
 
-# Force re-ingest all files
+# Force re-ingest all
 .venv-memory/bin/python engram/ingest.py --force --workers 6
-
-# Ingest specific file
-.venv-memory/bin/python engram/ingest.py --file memory/2026-03-09.md
 
 # Query memories
 .venv-memory/bin/python engram/context_query.py query "search terms" --agent main
@@ -186,31 +168,19 @@ Each agent's facts are scoped by `agent_id` on every node. Queries return `agent
 .venv-memory/bin/python engram/dedup_entities.py --dry-run
 .venv-memory/bin/python engram/dedup_entities.py --execute
 
-# Export sessions
-.venv-memory/bin/python engram/export_sessions.py
-
 # Stats
 .venv-memory/bin/python engram/engram.py stats
 
-# Dream consolidation (run nightly)
+# Dream consolidation (nightly)
 .venv-memory/bin/python engram/engram.py dream
 ```
 
 ## Troubleshooting
 
-**DB lock error:** Another process has the Kuzu DB open. Stop the dashboard (`pm2 delete engram-dashboard`) and wait 5 seconds.
-
-**Query returns 0 results:** The `context_query.py` splits multi-word queries into terms. Single short words (<3 chars) are skipped. Try more specific terms.
-
-**Cross-agent contamination:** Check `extract_agent_from_filepath()` — make sure your main memory dir defaults to your main agent, not `shared`.
-
-**Ingest slow:** Use `--workers 6` for parallel LLM extraction. Rate depends on your LLM provider.
-
-**Dashboard shows wrong counts after agent filter:** Ensure `agent_id` is set on all node types (Entity, Fact, Episode, Emotion). Run dedup if entities are duplicated.
-
-## Schema
-
-**Nodes:** Entity, Fact, Episode, Emotion, SessionState
-**Relationships:** RELATES_TO, CAUSED, PART_OF, MENTIONED_IN, EPISODE_EVOKES, ENTITY_EVOKES, DERIVED_FROM, ABOUT
-
-Every node has `agent_id` (string) for multi-agent isolation.
+| Issue | Fix |
+|---|---|
+| DB lock error | Stop dashboard (`pm2 delete engram-dashboard`), wait 5s |
+| Query returns 0 | Terms <3 chars are skipped. Use specific terms. |
+| Cross-agent bleed | Check `config.json` — ensure `memory_dir` maps to `main_agent_id`, not `shared` |
+| Slow ingest | Use `--workers 6` for parallel extraction |
+| Dashboard wrong counts | Run dedup, verify `agent_id` on nodes |
