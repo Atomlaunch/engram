@@ -175,10 +175,78 @@ Agent resolution order (in `extract_agent_from_filepath()`):
 .venv-memory/bin/python engram/engram.py dream
 ```
 
+## ⚠️ Critical Gotchas
+
+These are the most common ways the setup breaks. Read before installing.
+
+### 1. Plugin folder MUST be named `engram-context-engine`
+OpenClaw resolves plugins by folder name. The engram repo ships the plugin in `extensions/context-engine/` — that folder name does **not** match. You must either:
+
+**Option A (recommended):** Point `load.paths` to the parent of a correctly-named folder:
+```bash
+# Create a symlink or copy with the correct name
+mkdir -p ~/.openclaw/workspace/extensions
+cp -r /path/to/engram/extensions/context-engine \
+      ~/.openclaw/workspace/extensions/engram-context-engine
+```
+Then set:
+```json
+"load": { "paths": ["/home/<you>/.openclaw/workspace/extensions"] }
+```
+
+**Option B:** Point `load.paths` directly to the plugin's parent AND rename the folder:
+```bash
+mv /path/to/engram/extensions/context-engine \
+   /path/to/engram/extensions/engram-context-engine
+```
+```json
+"load": { "paths": ["/path/to/engram/extensions"] }
+```
+
+> ❌ Wrong: `"paths": ["/path/to/engram/extensions/context-engine"]`
+> ✅ Right: `"paths": ["/path/to/engram/extensions"]` (with folder renamed to `engram-context-engine`)
+
+### 2. `python_bin` path must exist before restart
+The plugin is loaded at OpenClaw startup. If the venv doesn't exist at the configured path, OpenClaw will crash and fail to start.
+
+Always verify before applying config:
+```bash
+ls /path/to/workspace/.venv-memory/bin/python
+```
+
+If it doesn't exist, complete Step 2 (Python environment) **before** applying Step 4 (plugin config).
+
+### 3. Apply config LAST — not mid-setup
+The agent may try to apply the OpenClaw config patch before the venv/plugin is ready. Always complete steps 1-3 fully before touching `openclaw.json`. The gateway restart triggered by the config patch will fail if any paths are invalid.
+
+### 4. Recovery if OpenClaw won't start
+If OpenClaw fails to start after adding engram, disable the plugin manually:
+```bash
+# Edit config directly
+nano ~/.openclaw/openclaw.json
+# Set: "engram-context-engine": { "enabled": false, ... }
+
+# Then restart
+openclaw gateway restart
+
+# Check logs for the real error
+cat /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log | grep -i "engram\|error\|plugin" | tail -30
+```
+
+### 5. Kuzu allows only one writer
+Never run ingest while the dashboard is running. Always stop the dashboard first:
+```bash
+pm2 delete engram-dashboard
+# wait 5s, then run ingest
+```
+
 ## Troubleshooting
 
 | Issue | Fix |
 |---|---|
+| OpenClaw won't start after adding engram | See Gotcha #4 above — disable plugin, check logs |
+| Plugin not loading (no context injected) | Folder name mismatch — see Gotcha #1 |
+| `python_bin` error on startup | venv path wrong or not created yet — see Gotcha #2 |
 | DB lock error | Stop dashboard (`pm2 delete engram-dashboard`), wait 5s |
 | Query returns 0 | Terms <3 chars are skipped. Use specific terms. |
 | Cross-agent bleed | Check `config.json` — ensure `memory_dir` maps to `main_agent_id`, not `shared` |
