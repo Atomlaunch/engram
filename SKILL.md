@@ -192,10 +192,15 @@ The plugin (`extensions/engram-context-engine/`) is the core integration with Op
 ### How it works
 
 **On every turn (`assemble()`):**
-1. Extracts search terms from the last 6 messages
-2. Queries Neo4j for matching entities, facts, and episodes
-3. Formats results as bullet points
-4. Injects them as `systemPromptAddition` in the prompt
+1. Fetches pinned facts first:
+   - global pinned facts for the agent
+   - channel-scoped pinned facts for the current channel (if any)
+   - session-scoped pinned facts for the current session (if any)
+2. Extracts search terms from the last 6 messages
+3. Queries Neo4j for matching entities, facts, and episodes
+4. Deduplicates pinned facts from normal recall
+5. Formats results as bullet points
+6. Injects them as `systemPromptAddition` in the prompt
 
 **After every turn (`afterTurn()`):**
 1. Extracts facts from user messages via regex patterns
@@ -257,8 +262,38 @@ python context_query.py store --fact "User prefers dark mode" --agent main
 # Store live turn facts (called by plugin automatically)
 python context_query.py store_live --text "message text" --agent main --session sess123
 
+# Get pinned facts for an agent/channel/session
+python context_query.py pinned --agent main --channel 1477540685002440796 --limit 5
+
 # LLM-based extraction (called by plugin as fallback)
 python context_query.py extract_llm --text "message text" --agent main --session sess123
+```
+
+### Scoped pinned facts
+
+Pinned facts are the standing rules that should inject even when search terms do not match.
+
+Scope behavior:
+- **Global**: applies everywhere for an agent
+- **Channel**: applies only in one channel (good for Discord style/tone/workflow rules)
+- **Session**: applies only in one session/thread
+
+Use channel-scoped pinned facts for things like:
+- Lady-channel tone/format rules
+- team- or workflow-specific Discord behavior
+- channel-local operational rules that should not bleed into every conversation
+
+Helper script:
+
+```bash
+# Seed channel-scoped pinned facts
+python scripts/seed_scoped_pinned.py \
+  --agent main \
+  --scope-type channel \
+  --scope-id 1477540685002440796 \
+  --category channel_rule \
+  --fact "In Lady2good's channel, reply with a warm, natural, personal tone instead of operator or task-manager voice." \
+  --fact "In Lady2good's channel, keep Discord formatting simple and human; avoid rigid report-style layouts unless asked."
 ```
 
 ---
@@ -299,6 +334,8 @@ python http_server.py
 | `agent_id` | Agent scope (isolation) |
 | `memory_tier` | `candidate` (new) or `canonical` (promoted by cron) |
 | `source_type` | `live_turn`, `live_llm`, `memory`, `live_context` |
+| `scope_type` | `global`, `channel`, or `session` (optional; defaults to global behavior when absent) |
+| `scope_id` | Channel ID or session key for scoped pinned facts |
 | `importance` | 0.0–1.0 ranking score |
 | `quality_score` | Data quality indicator |
 | `contamination_score` | Noise/pollution indicator |
@@ -339,6 +376,8 @@ engram/
 ├── run_ingest.py             ← Batch ingest runner
 ├── session.py                ← Session state management
 ├── mcp_server.py             ← MCP server (for tool-calling agents)
+├── scripts/
+│   └── seed_scoped_pinned.py ← Helper to seed global/channel/session pinned facts
 ├── update-cron.sh            ← Apply cron schedule from config
 ├── cleanup-sessions.sh       ← Session cleanup utility
 ├── requirements.txt          ← Python dependencies

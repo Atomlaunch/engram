@@ -126,6 +126,89 @@ def query_memories(terms: str, agent_id: Optional[str] = None, limit: int = 8) -
         return {"ok": False, "error": str(e), "entities": [], "facts": [], "episodes": []}
 
 
+def _load_pinned_config() -> dict:
+    """Load pinned injection config from engram/config.json."""
+    try:
+        cfg_path = Path(os.path.dirname(os.path.abspath(__file__))) / "config.json"
+        if cfg_path.exists():
+            import json as _json
+            with open(cfg_path) as f:
+                cfg = _json.load(f)
+            return cfg.get("context_engine", {}).get("pinned_injection", {})
+    except Exception:
+        pass
+    return {}
+
+
+def query_pinned(agent_id: Optional[str] = None, channel_id: Optional[str] = None, session_id: Optional[str] = None, limit: int = 5) -> dict:
+    """Return high-importance standing-rule facts for an agent plus optional scoped matches.
+
+    Scope model:
+    - global facts: no scope_type/scope_id
+    - channel facts: scope_type='channel' and scope_id matches current channel
+    - session facts: scope_type='session' and scope_id matches current session
+    """
+    pinned_cfg = _load_pinned_config()
+    if pinned_cfg.get("enabled") is False:
+        return {"ok": True, "facts": [], "disabled": True}
+
+    min_importance = float(pinned_cfg.get("min_importance", 0.9))
+    source_types = pinned_cfg.get("source_types", ["live_context"])
+    max_pinned = int(pinned_cfg.get("max_pinned", limit))
+
+    try:
+        conn = _get_conn(read_only=True)
+        source_filter = " OR ".join(f"f.source_type = '{st}'" for st in source_types)
+
+        scope_clauses = ["(f.scope_type IS NULL OR f.scope_type = '' OR lower(f.scope_type) = 'global')"]
+        params = {
+            "p_agent": agent_id or "main",
+            "p_min_imp": min_importance,
+            "p_limit": max_pinned,
+        }
+        if channel_id:
+            scope_clauses.append("(lower(f.scope_type) = 'channel' AND f.scope_id = $p_channel)")
+            params["p_channel"] = channel_id
+        if session_id:
+            scope_clauses.append("(lower(f.scope_type) = 'session' AND f.scope_id = $p_session)")
+            params["p_session"] = session_id
+
+        scope_filter = " OR ".join(scope_clauses)
+        results = conn.execute(
+            f"MATCH (f:Fact) "
+            f"WHERE f.agent_id = $p_agent "
+            f"AND ({source_filter}) "
+            f"AND f.importance >= $p_min_imp "
+            f"AND ({scope_filter}) "
+            f"AND (f.retrievable IS NULL OR f.retrievable = true) "
+            f"RETURN f.id, f.content, f.category, f.importance, f.memory_tier, f.scope_type, f.scope_id "
+            f"ORDER BY "
+            f"CASE "
+            f"  WHEN lower(coalesce(f.scope_type, 'global')) = 'session' THEN 3 "
+            f"  WHEN lower(coalesce(f.scope_type, 'global')) = 'channel' THEN 2 "
+            f"  ELSE 1 "
+            f"END DESC, "
+            f"f.importance DESC "
+            f"LIMIT $p_limit",
+            params,
+        )
+        facts = []
+        while results.has_next():
+            row = results.get_next()
+            facts.append({
+                "id": row[0],
+                "content": row[1],
+                "category": row[2],
+                "importance": row[3],
+                "memory_tier": row[4],
+                "scope_type": row[5],
+                "scope_id": row[6],
+            })
+        return {"ok": True, "facts": facts}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "facts": []}
+
+
 def store_fact(content: str, agent_id: str = "main", category: str = "preference",
                confidence: float = 0.9, importance: float = 0.7) -> dict:
     """Store a single fact into Engram's graph DB."""
@@ -133,14 +216,14 @@ def store_fact(content: str, agent_id: str = "main", category: str = "preference
         conn = _get_conn(read_only=False)
         from engram.ingest import generate_id
 
-        fact_id = generate_id("fact", content)
+        fact_id = generate_id("fact", content + "_" + agent_id)
         now = datetime.now()
 
-        # Check if fact already exists
+        # Check if fact already exists for this agent
         try:
             result = conn.execute(
-                "MATCH (f:Fact {id: $p_id}) RETURN f.id",
-                {"p_id": fact_id}
+                "MATCH (f:Fact {id: $p_id}) WHERE f.agent_id = $p_agent RETURN f.id",
+                {"p_id": fact_id, "p_agent": agent_id}
             )
             if result.has_next():
                 return {"ok": True, "stored": False, "reason": "duplicate", "id": fact_id}
@@ -741,6 +824,13 @@ if __name__ == "__main__":
     llm_parser.add_argument("--session", required=True, help="Session ID provenance")
     llm_parser.add_argument("--role", type=str, default="user", help="Message role")
 
+    # Pinned facts command
+    pin_parser = subparsers.add_parser("pinned", help="Get pinned/standing-rule facts")
+    pin_parser.add_argument("--agent", type=str, default="main", help="Agent ID scope")
+    pin_parser.add_argument("--channel", type=str, default=None, help="Optional channel scope")
+    pin_parser.add_argument("--session", type=str, default=None, help="Optional session scope")
+    pin_parser.add_argument("--limit", type=int, default=5)
+
     args = parser.parse_args()
 
     if args.command == "query":
@@ -764,6 +854,10 @@ if __name__ == "__main__":
 
     elif args.command == "extract_llm":
         result = extract_and_store_llm(args.text, agent_id=args.agent, session_id=args.session, role=args.role)
+        print(json.dumps(result, indent=2, default=str))
+
+    elif args.command == "pinned":
+        result = query_pinned(agent_id=args.agent, channel_id=args.channel, session_id=args.session, limit=args.limit)
         print(json.dumps(result, indent=2, default=str))
 
     else:
