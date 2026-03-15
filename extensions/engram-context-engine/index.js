@@ -249,6 +249,43 @@ function queryEngramMulti(cfg, searchTerms, agentId) {
   });
 }
 
+function getPinnedConfig(cfg) {
+  const engramCfg = loadEngramConfig(cfg.engramDir || path.join(cfg.workspaceRoot, "engram"));
+  const pinned = engramCfg?.context_engine?.pinned_injection || {};
+  return {
+    enabled: pinned.enabled !== false,
+    maxPinned: Number(pinned.max_pinned || 5),
+    minImportance: Number(pinned.min_importance || 0.9),
+  };
+}
+
+function extractChannelId(sessionId) {
+  const match = String(sessionId || "").match(/^[^:]+:[^:]+:[^:]+:channel:([^:]+)$/);
+  return match ? match[1] : null;
+}
+
+function queryPinnedFacts(cfg, agentId, scope = {}) {
+  return safeRun(cfg, "queryPinnedFacts", [], () => {
+    const pinnedCfg = getPinnedConfig(cfg);
+    if (!pinnedCfg.enabled) return [];
+    const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+    const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId || "main" };
+    const args = [script, "pinned", "--agent", agentId || "main", "--limit", String(pinnedCfg.maxPinned)];
+    if (scope.channelId) args.push("--channel", String(scope.channelId));
+    if (scope.sessionId) args.push("--session", String(scope.sessionId));
+    const res = spawnSync(cfg.pythonBin, args, { encoding: "utf8", env, timeout: 5000 });
+    if (res.status !== 0) return [];
+    const out = String(res.stdout || "").trim();
+    if (!out) return [];
+    try {
+      const parsed = JSON.parse(out);
+      return Array.isArray(parsed.facts) ? parsed.facts : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
 function formatEngramResults(results) {
   if (!results || typeof results !== "object") return "";
   // Handle structured response: {ok, entities, facts, episodes}
@@ -441,12 +478,43 @@ export default function register(api) {
 
       async assemble({ sessionId, messages }) {
         return safeRun(cfg, "assemble", { messages, estimatedTokens: 0 }, () => {
-          const searchTerms = buildSearchTerms(messages);
-          if (!searchTerms || searchTerms.length < 3) return { messages, estimatedTokens: 0 };
           const agentId = resolveAgentId(cfg, sessionId, null);
-          const results = queryEngramMulti(cfg, searchTerms, agentId);
-          const addition = formatEngramResults(results);
-          return { messages, estimatedTokens: 0, systemPromptAddition: cfg.includeSystemPromptAddition ? addition : undefined };
+          const channelId = extractChannelId(sessionId);
+
+          const pinned = queryPinnedFacts(cfg, agentId, { channelId, sessionId });
+          const pinnedLines = [];
+          const pinnedSeen = new Set();
+          for (const p of pinned) {
+            const text = String(p?.content || "").trim();
+            if (text && !pinnedSeen.has(text)) {
+              pinnedSeen.add(text);
+              pinnedLines.push(`- ${text}`);
+            }
+          }
+
+          const searchTerms = buildSearchTerms(messages);
+          let queryAddition = "";
+          if (searchTerms && searchTerms.length >= 3) {
+            const results = queryEngramMulti(cfg, searchTerms, agentId);
+            if (results && typeof results === "object") {
+              const facts = Array.isArray(results.facts)
+                ? results.facts.filter((f) => !pinnedSeen.has(String(f?.content || "").trim()))
+                : [];
+              results.facts = facts;
+            }
+            queryAddition = formatEngramResults(results);
+          }
+
+          const parts = [];
+          if (pinnedLines.length) {
+            parts.push("Standing rules:\n" + pinnedLines.join("\n"));
+          }
+          if (queryAddition) {
+            parts.push(queryAddition);
+          }
+          const addition = parts.join("\n\n");
+
+          return { messages, estimatedTokens: 0, systemPromptAddition: cfg.includeSystemPromptAddition && addition ? addition : undefined };
         });
       },
 

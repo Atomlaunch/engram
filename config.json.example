@@ -20,7 +20,13 @@
     "workspace_root": "/home/youruser/clawd",
     "engram_dir": "/home/youruser/clawd/engram",
     "python_bin": "/home/youruser/clawd/.venv-memory/bin/python",
-    "agents_dir": "/home/youruser/.openclaw/agents"
+    "agents_dir": "/home/youruser/.openclaw/agents",
+    "pinned_injection": {
+      "enabled": true,
+      "max_pinned": 5,
+      "min_importance": 0.9,
+      "source_types": ["live_context"]
+    }
   },
   "backend": "neo4j",
   "neo4j": {
