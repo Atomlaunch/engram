@@ -20,6 +20,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -264,6 +265,9 @@ LIVE_IMPORTANCE = 0.55
 LIVE_NON_ALPHA_MAX = 0.50
 LIVE_DEDUP_SIMILARITY = 0.86
 ENTITY_LIMIT = 8
+LOCAL_MODEL = os.environ.get("ENGRAM_LOCAL_MODEL", "qwen3.5:9b")
+LOCAL_MODEL_URL = os.environ.get("ENGRAM_LOCAL_MODEL_URL", "http://127.0.0.1:11434/api/generate")
+LOCAL_MODEL_TIMEOUT = int(os.environ.get("ENGRAM_LOCAL_MODEL_TIMEOUT", "20"))
 
 ATTRIBUTE_PAT = re.compile(r"\b([A-Z][\w@.-]*(?:\s+[A-Z][\w@.-]*)*)\s+(is|was|has|needs?|wants?|started|stopped)\s+([^.!?\n]{4,160})", re.IGNORECASE)
 REPORTED_PAT = re.compile(r"\b([A-Z][\w@.-]*(?:\s+[A-Z][\w@.-]*)*)\s+(said|told|mentioned|asked|requested)\s+([^.!?\n]{4,180})", re.IGNORECASE)
@@ -673,17 +677,171 @@ def store_live(text: str, agent_id: str, session_id: str, role: str = "user") ->
     return _store_live_candidates(conn, candidates, agent_id, session_id, role, "live_turn", LIVE_CONFIDENCE, LIVE_IMPORTANCE)
 
 
-def extract_and_store_llm(text: str, agent_id: str, session_id: str, role: str = "user") -> dict:
+def _best_named_entity(agent_id: str, names: list[str], lower_text: str) -> Optional[str]:
+    for name in names:
+        if name and name.lower() in lower_text:
+            return name
+    for name in names:
+        if name and name != agent_id:
+            return name
+    return names[0] if names else None
+
+
+def _extract_known_entities(agent_id: str, text: str) -> list[str]:
+    names = []
+    if agent_id and agent_id not in names:
+        names.append(agent_id)
+    for name in _extract_named_entities(text):
+        if name not in names:
+            names.append(name)
+    return names[:ENTITY_LIMIT]
+
+
+def _extract_relationship_hints(clean_text: str, known_entities: list[str], agent_id: str) -> list[str]:
+    hints = []
+    lower = clean_text.lower()
+    spouse = next((n for n in known_entities if n != agent_id), None)
+    if spouse and ("my wife" in lower or re.search(r"\bshe\b", lower)):
+        hints.append(f"{spouse} is {agent_id}'s wife")
+    return hints[:3]
+
+
+_AGENT_ID_TO_HUMAN: dict[str, str] = {
+    "main": "TheDev",
+}
+
+def _resolve_speaker_name(speaker: Optional[str], agent_id: str) -> str:
+    """Resolve a human-readable speaker name, never returning a raw agent id like 'main'."""
+    if speaker and speaker.lower() not in ("main", "assistant", "system", "user", ""):
+        return speaker
+    # If no speaker passed, try to map agent_id to known human owner
+    return _AGENT_ID_TO_HUMAN.get(agent_id, agent_id)
+
+def _build_local_model_prompt(clean_text: str, agent_id: str, speaker: Optional[str] = None) -> str:
+    speaker_name = _resolve_speaker_name(speaker, agent_id)
+    known_entities = _extract_known_entities(agent_id, clean_text)
+    if speaker and speaker not in known_entities:
+        known_entities.insert(0, speaker)
+    lower = clean_text.lower()
+    if "lady2good" not in lower and ("my wife" in lower or re.search(r"\bshe\b", lower)):
+        if "Lady2good" not in known_entities:
+            known_entities.insert(0, "Lady2good")
+    relationship_hints = _extract_relationship_hints(clean_text, known_entities, speaker_name)
+    lines = [
+        'Extract durable memory facts from this chat. Return ONLY valid JSON.',
+        'Schema: {"facts": ["fact 1", "fact 2"]}',
+        'Rules:',
+        '- Max 3 facts.',
+        '- Only extract NEW durable facts supported by the current_message.',
+        '- Durable facts are things worth remembering FOREVER about a person or topic.',
+        '- GOOD facts: identity, preferences, relationships, stable attributes, birthdays, anniversaries, vehicles, family details, hobbies, health conditions, long-term plans.',
+        '- BAD facts (NEVER extract these): timestamps, dates, times, session info, process IDs, command lines, file paths, technical logs, model names, config values, debug output, cron job IDs, port numbers, IP addresses, API keys, error messages.',
+        '- If the message is mostly technical/operational (debugging, config, system status), return {"facts": []}.',
+        '- Do NOT restate relationship_hints or known background unless needed to resolve a pronoun.',
+        '- Prefer explicit names from known_entities over generic phrases when clearly supported by context.',
+        f'- The current speaker is "{speaker_name}". When the message says "I", "my", "me", map those to "{speaker_name}".',
+        f'- Never use internal agent ids like "main" in facts. Always use the speaker name "{speaker_name}" instead.',
+        '- If the user says "I prefer X", convert it to "<speaker_name> prefers X".',
+        '- If the user says "my favorite X is Y", convert it to "<speaker_name>\'s favorite X is Y".',
+        '- If the user states a birthday/date about themselves, convert it to a named fact using the speaker name.',
+        '- If pronouns like she/he/my wife clearly refer to a named entity from context, use that exact name.',
+        '- Keep facts short, direct, and canonical.',
+        '- When in doubt, return {"facts": []}. Silence is better than junk.',
+        '',
+        'Context:',
+        f'speaker_name: {speaker_name}',
+        f'known_entities: {", ".join(known_entities)}',
+    ]
+    if relationship_hints:
+        lines.append('relationship_hints:')
+        lines.extend(f'- {hint}' for hint in relationship_hints)
+    lines.extend([
+        'recent_context:',
+        'current_message:',
+        f'- User: {clean_text}',
+    ])
+    return "\n".join(lines)
+
+
+def _call_local_model(clean_text: str, agent_id: str, speaker: Optional[str] = None) -> tuple[list[str], Optional[str]]:
+    payload = {
+        "model": LOCAL_MODEL,
+        "prompt": _build_local_model_prompt(clean_text, agent_id, speaker=speaker),
+        "stream": False,
+        "format": "json",
+        "think": False,
+        "options": {
+            "temperature": 0,
+            "num_predict": 140,
+            "num_ctx": 1024,
+        },
+    }
+    req = urllib.request.Request(
+        LOCAL_MODEL_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "Engram/1.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LOCAL_MODEL_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return [], str(e)
+
+    content = (body.get("response") or body.get("thinking") or "").strip()
+    if not content:
+        return [], None
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        facts = _parse_llm_fact_array(content)
+        return facts, None
+
+    if isinstance(parsed, dict):
+        facts = parsed.get("facts", [])
+        if isinstance(facts, list):
+            out = []
+            for item in facts[:LIVE_MAX_FACTS]:
+                fact = _clean_space(item)
+                if fact and fact not in out:
+                    out.append(fact)
+            return out, None
+    return [], None
+
+
+def _extract_speaker_from_envelope(text: str) -> Optional[str]:
+    """Try to extract the human speaker name from OpenClaw Discord envelope metadata."""
+    import re as _re
+    patterns = [
+        _re.compile(r'"sender"\s*:\s*"([^"]+)"'),
+        _re.compile(r'"name"\s*:\s*"([^"]+)"'),
+        _re.compile(r'senderLabel.*?"([A-Za-z0-9_]+)\s*\('),
+        _re.compile(r'"label"\s*:\s*"([^"(]+)'),
+    ]
+    for pat in patterns:
+        m = pat.search(str(text or ""))
+        if m:
+            name = m.group(1).strip()
+            if name and len(name) >= 2 and name.lower() not in ("user", "assistant", "system", "true", "false", "untrusted"):
+                return name
+    return None
+
+
+def extract_and_store_llm(text: str, agent_id: str, session_id: str, role: str = "user", speaker: Optional[str] = None) -> dict:
     text = str(text or "").strip()
     agent_id = str(agent_id or "").strip()
     session_id = str(session_id or "").strip()
     role = str(role or "user").strip()
+    speaker = str(speaker or "").strip() or None
+
+    # Fallback: try to extract speaker from envelope metadata in the raw text
+    if not speaker:
+        speaker = _extract_speaker_from_envelope(text)
 
     if not agent_id:
         return {"ok": False, "error": "agent_id required"}
     if not session_id:
         return {"ok": False, "error": "session_id required"}
-    # Strip envelope metadata
     clean_text = _strip_envelope(text)
     if not clean_text or len(clean_text) < LIVE_MIN_CHARS:
         return {"ok": True, "stored": 0, "skipped": True, "reason": "envelope_stripped_too_short"}
@@ -692,52 +850,9 @@ def extract_and_store_llm(text: str, agent_id: str, session_id: str, role: str =
     if _is_noise(clean_text):
         return {"ok": True, "stored": 0, "skipped": True, "reason": "noise_filtered"}
 
-    api_key = _lookup_xai_api_key()
-    if not api_key:
-        return {"ok": False, "error": "XAI_API_KEY not configured"}
-
-    payload = {
-        "model": "grok-3-mini-fast",
-        "messages": [
-            {
-                "role": "system",
-                "content": "Extract key facts worth remembering from this message. Return a JSON array of strings, max 3 facts. Only meaningful, durable information (names, dates, decisions, preferences, events, relationships). If nothing worth remembering, return []. No explanations, just the JSON array.",
-            },
-            {"role": "user", "content": clean_text},
-        ],
-        "max_tokens": 150,
-        "temperature": 0,
-    }
-
-    req = urllib.request.Request(
-        "https://api.x.ai/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "Engram/1.0",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            detail = str(e)
-        return {"ok": False, "error": f"xAI API HTTP {e.code}: {detail[:300]}"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-    try:
-        content = body["choices"][0]["message"]["content"]
-        facts = _parse_llm_fact_array(content)
-    except Exception as e:
-        return {"ok": False, "error": f"invalid xAI response: {e}"}
-
+    facts, err = _call_local_model(clean_text, agent_id, speaker=speaker)
+    if err:
+        return {"ok": False, "error": f"local model error: {err}"}
     if not facts:
         return {"ok": True, "stored": 0, "skipped": True, "reason": "no_candidates", "facts": []}
 
@@ -746,7 +861,7 @@ def extract_and_store_llm(text: str, agent_id: str, session_id: str, role: str =
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-    named = _extract_named_entities(text)
+    named = _extract_known_entities(agent_id, clean_text)
     candidates = [
         {
             "content": fact,
@@ -823,6 +938,7 @@ if __name__ == "__main__":
     llm_parser.add_argument("--agent", required=True, help="Strict agent ID scope")
     llm_parser.add_argument("--session", required=True, help="Session ID provenance")
     llm_parser.add_argument("--role", type=str, default="user", help="Message role")
+    llm_parser.add_argument("--speaker", type=str, default=None, help="Human-facing speaker name")
 
     # Pinned facts command
     pin_parser = subparsers.add_parser("pinned", help="Get pinned/standing-rule facts")
@@ -853,7 +969,7 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2, default=str))
 
     elif args.command == "extract_llm":
-        result = extract_and_store_llm(args.text, agent_id=args.agent, session_id=args.session, role=args.role)
+        result = extract_and_store_llm(args.text, agent_id=args.agent, session_id=args.session, role=args.role, speaker=args.speaker)
         print(json.dumps(result, indent=2, default=str))
 
     elif args.command == "pinned":

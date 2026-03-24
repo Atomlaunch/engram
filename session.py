@@ -39,7 +39,8 @@ def generate_session_id(session_key: str) -> str:
 
 def save_session_state(conn: kuzu.Connection, session_key: str, summary: str,
                        open_threads: str = "", mood: str = "neutral",
-                       message_count: int = 0, entity_names: list[str] = None) -> str:
+                       message_count: int = 0, entity_names: list[str] = None,
+                       agent_id: str = "main", channel: str = "", context: str = "") -> str:
     """Save session state to the graph."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sid = generate_session_id(session_key)
@@ -52,6 +53,9 @@ def save_session_state(conn: kuzu.Connection, session_key: str, summary: str,
             "s.open_threads = $p_threads, "
             "s.mood = $p_mood, "
             "s.message_count = $p_mc, "
+            "s.agent_id = $p_agent, "
+            "s.channel = $p_channel, "
+            "s.context = $p_context, "
             "s.ended_at = timestamp($p_now), "
             "s.created_at = CASE WHEN s.created_at IS NULL THEN timestamp($p_now) ELSE s.created_at END",
             {
@@ -61,6 +65,9 @@ def save_session_state(conn: kuzu.Connection, session_key: str, summary: str,
                 "p_threads": open_threads,
                 "p_mood": mood,
                 "p_mc": message_count,
+                "p_agent": agent_id,
+                "p_channel": channel,
+                "p_context": context,
                 "p_now": now_str
             }
         )
@@ -87,21 +94,33 @@ def save_session_state(conn: kuzu.Connection, session_key: str, summary: str,
         return ""
 
 
-def get_last_session(conn: kuzu.Connection) -> Optional[dict]:
-    """Get the most recent session state."""
+def get_last_session(conn: kuzu.Connection, agent_id: str = None) -> Optional[dict]:
+    """Get the most recent session state, optionally filtered by agent."""
     try:
-        result = conn.execute(
-            "MATCH (s:SessionState) "
-            "RETURN s.id, s.session_key, s.summary, s.open_threads, "
-            "s.mood, s.message_count, s.ended_at "
-            "ORDER BY s.ended_at DESC LIMIT 1"
-        )
+        if agent_id:
+            result = conn.execute(
+                "MATCH (s:SessionState) WHERE s.agent_id = $p_agent "
+                "RETURN s.id, s.session_key, s.summary, s.open_threads, "
+                "s.mood, s.message_count, s.ended_at, s.agent_id, s.channel, s.context "
+                "ORDER BY s.ended_at DESC LIMIT 1",
+                {"p_agent": agent_id}
+            )
+        else:
+            result = conn.execute(
+                "MATCH (s:SessionState) "
+                "RETURN s.id, s.session_key, s.summary, s.open_threads, "
+                "s.mood, s.message_count, s.ended_at, s.agent_id, s.channel, s.context "
+                "ORDER BY s.ended_at DESC LIMIT 1"
+            )
         if result.has_next():
             row = result.get_next()
             session = {
                 "id": row[0], "session_key": row[1], "summary": row[2],
                 "open_threads": row[3], "mood": row[4],
-                "message_count": row[5], "ended_at": str(row[6])
+                "message_count": row[5], "ended_at": str(row[6]),
+                "agent_id": row[7] or "main",
+                "channel": row[8] or "",
+                "context": row[9] or ""
             }
             
             # Get referenced entities
@@ -125,12 +144,13 @@ def get_last_session(conn: kuzu.Connection) -> Optional[dict]:
 
 
 def list_sessions(conn: kuzu.Connection, limit: int = 10) -> list[dict]:
-    """List recent session states."""
+    """List recent session states across all agents."""
     sessions = []
     try:
         result = conn.execute(
             "MATCH (s:SessionState) "
-            "RETURN s.id, s.session_key, s.summary, s.mood, s.ended_at, s.message_count "
+            "RETURN s.id, s.session_key, s.summary, s.mood, s.ended_at, "
+            "s.message_count, s.agent_id, s.channel, s.context "
             "ORDER BY s.ended_at DESC LIMIT $p_lim",
             {"p_lim": limit}
         )
@@ -138,7 +158,9 @@ def list_sessions(conn: kuzu.Connection, limit: int = 10) -> list[dict]:
             row = result.get_next()
             sessions.append({
                 "id": row[0], "session_key": row[1], "summary": row[2],
-                "mood": row[3], "ended_at": str(row[4]), "message_count": row[5]
+                "mood": row[3], "ended_at": str(row[4]), "message_count": row[5],
+                "agent_id": row[6] or "main", "channel": row[7] or "",
+                "context": row[8] or ""
             })
     except Exception as e:
         print(f"Error listing sessions: {e}")
@@ -159,6 +181,9 @@ if __name__ == "__main__":
     save_parser.add_argument("--mood", default="neutral", help="Session mood")
     save_parser.add_argument("--messages", type=int, default=0, help="Message count")
     save_parser.add_argument("--entities", nargs="*", help="Referenced entity names")
+    save_parser.add_argument("--agent", default="main", help="Agent ID (e.g. main, or any custom agent name)")
+    save_parser.add_argument("--channel", default="", help="Channel (discord/telegram/etc)")
+    save_parser.add_argument("--context", default="", help="Context label (e.g. #workspace, #lady2good, direct)")
     
     # Restore command
     restore_parser = subparsers.add_parser("restore", help="Get last session state")
@@ -179,7 +204,10 @@ if __name__ == "__main__":
             open_threads=args.threads,
             mood=args.mood,
             message_count=args.messages,
-            entity_names=args.entities or []
+            entity_names=args.entities or [],
+            agent_id=args.agent,
+            channel=args.channel,
+            context=args.context
         )
     
     elif args.command == "restore":
