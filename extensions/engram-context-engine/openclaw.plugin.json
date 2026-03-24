@@ -1,6 +1,6 @@
 {
   "id": "engram-context-engine",
-  "kind": "context-engine",
+  "kind": "memory",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
