@@ -17,7 +17,44 @@ const DEFAULTS = {
   includeSystemPromptAddition: true,
   ownsCompaction: false,
   keepRecentMessages: 12,
+  // Cache settings (new)
+  assembleCacheTtlMs: 3 * 60 * 1000,   // re-query Neo4j at most once every 3 min per session
+  pinnedCacheTtlMs: 10 * 60 * 1000,    // pinned facts change rarely — cache 10 min per session
 };
+
+// ─── Session-scoped assembly cache ───────────────────────────────────────────
+// Keyed by sessionId. Stores { termsHash, result, expiresAt } so we skip
+// redundant Neo4j subprocess calls when the conversation topic hasn't changed.
+const _assembleCache = new Map();  // sessionId → { termsHash, result, expiresAt }
+const _pinnedCache   = new Map();  // sessionId → { facts, expiresAt }
+
+function hashTerms(terms) {
+  // Stable hash of sorted search terms — cheap change detector.
+  return Array.isArray(terms) ? [...terms].sort().join("|") : "";
+}
+
+function getCachedAssembly(sessionId, termsHash, ttlMs) {
+  const entry = _assembleCache.get(sessionId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _assembleCache.delete(sessionId); return null; }
+  if (entry.termsHash !== termsHash) return null;  // topic shifted — miss
+  return entry.result;
+}
+
+function setCachedAssembly(sessionId, termsHash, result, ttlMs) {
+  _assembleCache.set(sessionId, { termsHash, result, expiresAt: Date.now() + ttlMs });
+}
+
+function getCachedPinned(sessionId, ttlMs) {
+  const entry = _pinnedCache.get(sessionId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _pinnedCache.delete(sessionId); return null; }
+  return entry.facts;
+}
+
+function setCachedPinned(sessionId, facts, ttlMs) {
+  _pinnedCache.set(sessionId, { facts, expiresAt: Date.now() + ttlMs });
+}
 
 function log(cfg, level, message, extra = undefined) {
   if (!cfg?.debug && level === "debug") return;
@@ -77,24 +114,61 @@ function extractAgentFromPath(sessionFile) {
   return String(sessionFile).match(/[\\/]agents[\\/]([^\\/]+)[\\/]sessions[\\/]/)?.[1] || null;
 }
 
+function extractAgentFromSessionKey(sessionId) {
+  // OpenClaw session keys often look like "agent:<agentId>:discord:channel:xxx"
+  // or contain the agent ID after "agent:" prefix
+  const match = String(sessionId || "").match(/^agent:([^:]+):/);
+  return match ? match[1] : null;
+}
+
 function resolveAgentId(cfg, sessionId, sessionFile) {
   const cached = _liveSessionAgentCache.get(sessionId);
   if (cached) return cached;
+
+  // 1. Try extracting from session file path (most reliable)
   const fromPath = extractAgentFromPath(sessionFile);
   if (fromPath) {
     _liveSessionAgentCache.set(sessionId, fromPath);
     return fromPath;
   }
+
+  // 2. Try extracting from session key format (agent:<id>:...)
+  const fromKey = extractAgentFromSessionKey(sessionId);
+  if (fromKey) {
+    _liveSessionAgentCache.set(sessionId, fromKey);
+    return fromKey;
+  }
+
+  // 3. Scan agent dirs for the session file (UUID-based sessions)
   return safeRun(cfg, "resolveAgentId", "main", () => {
     const agents = fs.readdirSync(cfg.agentsDir, { withFileTypes: true });
     for (const entry of agents) {
       if (!entry.isDirectory()) continue;
-      const sessFile = path.join(cfg.agentsDir, entry.name, "sessions", `${sessionId}.jsonl`);
+      const sessDir = path.join(cfg.agentsDir, entry.name, "sessions");
+      // Check exact .jsonl match
+      const sessFile = path.join(sessDir, `${sessionId}.jsonl`);
       if (fs.existsSync(sessFile)) {
         _liveSessionAgentCache.set(sessionId, entry.name);
         return entry.name;
       }
+      // Also check sessions.json index for UUID mapping
+      const indexFile = path.join(sessDir, "sessions.json");
+      if (fs.existsSync(indexFile)) {
+        try {
+          const index = JSON.parse(fs.readFileSync(indexFile, "utf8"));
+          // sessions.json maps channel keys to session UUIDs or vice versa
+          const sessions = Array.isArray(index) ? index : Object.values(index);
+          for (const s of sessions) {
+            const sid = typeof s === "string" ? s : s?.id || s?.sessionId || "";
+            if (sid === sessionId) {
+              _liveSessionAgentCache.set(sessionId, entry.name);
+              return entry.name;
+            }
+          }
+        } catch { /* ignore parse errors */ }
+      }
     }
+    log(cfg, "warn", `resolveAgentId: could not resolve agent for session ${sessionId}, defaulting to main`);
     return "main";
   });
 }
@@ -169,6 +243,25 @@ function storeLiveTurn(cfg, sessionId, agentId, msg) {
   });
 }
 
+function extractSpeakerFromText(text) {
+  // Try to extract speaker name from OpenClaw Discord envelope metadata embedded in the message
+  const patterns = [
+    /"sender"\s*:\s*"([^"]+)"/,
+    /"name"\s*:\s*"([^"]+)"/,
+    /"label"\s*:\s*"([^"(]+)/,
+  ];
+  for (const pat of patterns) {
+    const m = pat.exec(String(text || ""));
+    if (m) {
+      const name = m[1].trim();
+      if (name && name.length >= 2 && !["user","assistant","system","true","false","untrusted"].includes(name.toLowerCase())) {
+        return name;
+      }
+    }
+  }
+  return null;
+}
+
 function storeLiveLLM(cfg, sessionId, agentId, msg) {
   return safeRun(cfg, "storeLiveLLM", undefined, () => {
     if (msg?.role !== "user") return undefined;
@@ -176,9 +269,13 @@ function storeLiveLLM(cfg, sessionId, agentId, msg) {
     if (String(msg?.text || "").length <= 30) return undefined;
     const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
     const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
+    // Extract speaker from envelope metadata so facts are attributed to the real human name
+    const speaker = extractSpeakerFromText(msg.text);
+    const args = [script, "extract_llm", "--text", msg.text, "--agent", agentId, "--session", sessionId];
+    if (speaker) args.push("--speaker", speaker);
     const child = spawn(
       cfg.pythonBin,
-      [script, "extract_llm", "--text", msg.text, "--agent", agentId, "--session", sessionId],
+      args,
       { env, stdio: "ignore", detached: true }
     );
     child.on("error", (err) => {
@@ -246,6 +343,43 @@ function queryEngramMulti(cfg, searchTerms, agentId) {
     const out = String(res.stdout || "").trim();
     if (!out) return [];
     return JSON.parse(out);
+  });
+}
+
+function getPinnedConfig(cfg) {
+  const engramCfg = loadEngramConfig(cfg.engramDir || path.join(cfg.workspaceRoot, "engram"));
+  const pinned = engramCfg?.context_engine?.pinned_injection || {};
+  return {
+    enabled: pinned.enabled !== false,
+    maxPinned: Number(pinned.max_pinned || 5),
+    minImportance: Number(pinned.min_importance || 0.9),
+  };
+}
+
+function extractChannelId(sessionId) {
+  const match = String(sessionId || "").match(/^[^:]+:[^:]+:[^:]+:channel:([^:]+)$/);
+  return match ? match[1] : null;
+}
+
+function queryPinnedFacts(cfg, agentId, scope = {}) {
+  return safeRun(cfg, "queryPinnedFacts", [], () => {
+    const pinnedCfg = getPinnedConfig(cfg);
+    if (!pinnedCfg.enabled) return [];
+    const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+    const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId || "main" };
+    const args = [script, "pinned", "--agent", agentId || "main", "--limit", String(pinnedCfg.maxPinned)];
+    if (scope.channelId) args.push("--channel", String(scope.channelId));
+    if (scope.sessionId) args.push("--session", String(scope.sessionId));
+    const res = spawnSync(cfg.pythonBin, args, { encoding: "utf8", env, timeout: 5000 });
+    if (res.status !== 0) return [];
+    const out = String(res.stdout || "").trim();
+    if (!out) return [];
+    try {
+      const parsed = JSON.parse(out);
+      return Array.isArray(parsed.facts) ? parsed.facts : [];
+    } catch {
+      return [];
+    }
   });
 }
 
@@ -329,12 +463,27 @@ function splitTranscriptForCompaction(messages, opts = {}) {
   return { olderMessages: messages.slice(0, -keepRecent), recentTail: messages.slice(-keepRecent) };
 }
 
+function isEnvelopeNoise(text) {
+  // Filter out Discord message envelopes, raw JSON blobs, tool outputs
+  const t = String(text || "").trim();
+  if (t.startsWith("{") || t.startsWith("[")) return true;           // raw JSON
+  if (t.includes('"message_id"') || t.includes('"sender_id"')) return true;  // Discord envelope
+  if (t.includes('"sender_label"') || t.includes('"has_reply_context"')) return true;
+  if (t.includes("Conversation info (untrusted metadata)")) return true;
+  if (t.includes("Config warnings:") || t.includes("plugins.entries")) return true;
+  if (t.includes("toolCall") || t.includes("toolResult")) return true;
+  if (t.includes("Process exited with code")) return true;
+  if (t.length > 800) return true;  // anything this long in durable memory is probably noise
+  return false;
+}
+
 function extractExplicitDurableMemories(messages) {
   const needles = ["remember this", "remember ", "always ", "never ", "favorite", "prefers", "likes ", "birthday", "anniversary", "policy", "working on", "project is"];
   return (Array.isArray(messages) ? messages : [])
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => ({ ...m, lower: String(m.text || "").toLowerCase() }))
     .filter((m) => needles.some((n) => m.lower.includes(n)))
+    .filter((m) => !isEnvelopeNoise(m.text))  // strip raw metadata/JSON blobs
     .map((m) => ({ role: m.role, text: m.text, summary: summarizeRecord(m) }));
 }
 
@@ -362,12 +511,24 @@ function bulletize(lines) {
 
 function buildStructuredCompactionSummary(messages) {
   const items = Array.isArray(messages) ? messages : [];
-  const userMsgs = items.filter((m) => m.role === "user").map((m) => m.text);
-  const asstMsgs = items.filter((m) => m.role === "assistant").map((m) => m.text);
+  // Filter envelope noise before building summary bullets
+  const clean = (msgs) => msgs.filter((t) => !isEnvelopeNoise(t));
+  const userMsgs = clean(items.filter((m) => m.role === "user").map((m) => m.text));
+  const asstMsgs = clean(items.filter((m) => m.role === "assistant").map((m) => m.text));
   const objective = bulletize(userMsgs.slice(-3).map((t) => summarizeRecord({ text: t })));
   const established = bulletize(asstMsgs.slice(-5).map((t) => summarizeRecord({ text: t })));
-  const decisions = bulletize(items.map((m) => m.text).filter((t) => /decid|will do|going to|fixed|changed|disabled|enabled/i.test(t)).map((t) => summarizeRecord({ text: t })).slice(-6));
-  const openLoops = bulletize(items.map((m) => m.text).filter((t) => /todo|next|need to|follow up|pending|block|later/i.test(t)).map((t) => summarizeRecord({ text: t })).slice(-6));
+  const decisions = bulletize(
+    clean(items.map((m) => m.text))
+      .filter((t) => /decid|will do|going to|fixed|changed|disabled|enabled/i.test(t))
+      .map((t) => summarizeRecord({ text: t }))
+      .slice(-6)
+  );
+  const openLoops = bulletize(
+    clean(items.map((m) => m.text))
+      .filter((t) => /todo|next|need to|follow up|pending|block|later/i.test(t))
+      .map((t) => summarizeRecord({ text: t }))
+      .slice(-6)
+  );
   return ["Compacted session state", "", "Objective:", ...objective, "", "Established facts:", ...established, "", "Decisions made:", ...decisions, "", "Open loops:", ...openLoops].join("\n");
 }
 
@@ -378,9 +539,345 @@ function buildCompactedMessages(summary, recentTail) {
 }
 
 export default function register(api) {
-  console.log("[engram-context-engine] DEBUG api.config raw:", JSON.stringify(api?.config ?? "UNDEFINED"));
   const cfg = getConfig(api);
   log(cfg, "log", "register called", { ownsCompaction: !!cfg.ownsCompaction });
+
+  // ─── engram_search tool: on-demand Neo4j graph memory search ───
+  api.registerTool(
+    {
+      name: "engram_search",
+      label: "Engram Search",
+      description:
+        "Search Engram's Neo4j graph memory for facts, entities, and episodes. " +
+        "Use this for recall questions about people, preferences, past events, decisions, or any stored knowledge. " +
+        "Returns structured results from the knowledge graph including facts, entities, and temporal episodes. " +
+        "Preferred over memory_search for personal/contextual recall.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Natural language search query (e.g. 'TheDev favorite soda', 'Lady2good kids', 'car insurance policy')",
+          },
+          agent: {
+            type: "string",
+            description: "Agent ID to search within. Defaults to 'main'.",
+          },
+          maxResults: {
+            type: "number",
+            description: "Maximum number of results to return. Defaults to 8.",
+          },
+        },
+        required: ["query"],
+      },
+      async execute(_toolCallId, params) {
+        const query = String(params?.query || "").trim();
+        if (!query) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: "query parameter is required" }) }],
+            details: { ok: false },
+          };
+        }
+        const agentId = String(params?.agent || "main").trim();
+        const limit = Number(params?.maxResults) || cfg.topK || 8;
+
+        try {
+          const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+          const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
+          const res = spawnSync(
+            cfg.pythonBin,
+            [script, "query", query, "--agent", agentId, "--limit", String(limit), "--json"],
+            { encoding: "utf8", env, timeout: 15000 }
+          );
+
+          if (res.status !== 0) {
+            const stderr = String(res.stderr || "").trim().slice(0, 500);
+            log(cfg, "error", "engram_search query failed", { status: res.status, stderr });
+            return {
+              content: [{ type: "text", text: JSON.stringify({ ok: false, error: "query failed", stderr }) }],
+              details: { ok: false },
+            };
+          }
+
+          const out = String(res.stdout || "").trim();
+          if (!out) {
+            return {
+              content: [{ type: "text", text: JSON.stringify({ ok: true, results: [], message: "No results found" }) }],
+              details: { ok: true, empty: true },
+            };
+          }
+
+          const parsed = JSON.parse(out);
+          const formatted = formatEngramResults(parsed);
+          const resultCount =
+            (Array.isArray(parsed?.facts) ? parsed.facts.length : 0) +
+            (Array.isArray(parsed?.entities) ? parsed.entities.length : 0) +
+            (Array.isArray(parsed?.episodes) ? parsed.episodes.length : 0);
+
+          return {
+            content: [{ type: "text", text: formatted || "No relevant memories found." }],
+            details: { ok: true, resultCount, raw: parsed },
+          };
+        } catch (err) {
+          log(cfg, "error", "engram_search execute error", { error: String(err?.stack || err) });
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: String(err) }) }],
+            details: { ok: false },
+          };
+        }
+      },
+    },
+    { names: ["engram_search"], optional: true }
+  );
+
+  // ─── engram_store tool: explicitly store a fact/memory into Neo4j ───
+  api.registerTool(
+    {
+      name: "engram_store",
+      label: "Engram Store",
+      description:
+        "Store a specific fact, preference, or memory into Engram's Neo4j graph. " +
+        "Use when someone explicitly says 'remember this' or when you identify durable information worth persisting. " +
+        "Facts are stored with agent scope and can be recalled cross-session.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: {
+            type: "string",
+            description: "The fact or memory to store (e.g. 'TheDev\\'s favorite soda is RootBeer')",
+          },
+          agent: {
+            type: "string",
+            description: "Agent ID to store under. Defaults to 'main'.",
+          },
+        },
+        required: ["text"],
+      },
+      async execute(_toolCallId, params) {
+        const text = String(params?.text || "").trim();
+        if (!text) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: "text parameter is required" }) }],
+            details: { ok: false },
+          };
+        }
+        const agentId = String(params?.agent || "main").trim();
+
+        try {
+          const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+          const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
+          const res = spawnSync(
+            cfg.pythonBin,
+            [script, "store_live", "--text", text, "--agent", agentId, "--session", "manual", "--role", "user"],
+            { encoding: "utf8", env, timeout: 10000 }
+          );
+
+          if (res.status !== 0) {
+            // Fallback to LLM extraction for richer parsing
+            const llmRes = spawnSync(
+              cfg.pythonBin,
+              [script, "extract_llm", "--text", text, "--agent", agentId, "--session", "manual"],
+              { encoding: "utf8", env, timeout: 15000 }
+            );
+            const llmOk = llmRes.status === 0;
+            return {
+              content: [{ type: "text", text: JSON.stringify({ ok: llmOk, method: "llm_extract", text }) }],
+              details: { ok: llmOk, method: "llm_extract" },
+            };
+          }
+
+          const out = String(res.stdout || "").trim();
+          let result = {};
+          try { result = out ? JSON.parse(out) : {}; } catch { result = { raw: out }; }
+
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ok: true, stored: true, ...result }) }],
+            details: { ok: true, stored: true },
+          };
+        } catch (err) {
+          log(cfg, "error", "engram_store execute error", { error: String(err?.stack || err) });
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: String(err) }) }],
+            details: { ok: false },
+          };
+        }
+      },
+    },
+    { names: ["engram_store"], optional: true }
+  );
+
+  log(cfg, "log", "registered engram_search and engram_store tools");
+
+  // ─── Memory Plugin: replace memory-core with Engram Neo4j backend ────────
+  // Registers memory_search and memory_get tools backed by the knowledge graph.
+  // memory-core must be disabled in config so Engram wins the exclusive memory slot.
+
+  api.registerMemoryPromptSection(({ availableTools }) => {
+    const hasSearch = availableTools.has("memory_search");
+    const hasGet = availableTools.has("memory_get");
+    if (!hasSearch && !hasGet) return [];
+    const lines = [
+      "## Memory Recall",
+      "Before answering questions about prior work, people, preferences, decisions, or past events: " +
+      "run memory_search to query the Engram knowledge graph (Neo4j). " +
+      "Results include facts, entities, and temporal episodes with importance scores. " +
+      "Prefer memory_search over guessing from context alone.",
+    ];
+    if (hasGet) lines.push("Use memory_get to read specific memory files when a path is known.");
+    lines.push("");
+    return lines;
+  });
+
+  // memory_search — Neo4j graph-backed semantic search
+  api.registerTool(
+    {
+      name: "memory_search",
+      label: "Memory Search (Engram)",
+      description:
+        "Mandatory recall step: search Engram's Neo4j knowledge graph for facts, people, preferences, " +
+        "decisions, and past events before answering memory questions. Returns ranked results with importance scores.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Natural language search query (e.g. 'TheDev favorite drink', 'Lady2good kids', 'car insurance')",
+          },
+          maxResults: {
+            type: "number",
+            description: "Maximum results to return (default: 8)",
+          },
+        },
+        required: ["query"],
+      },
+      async execute(_toolCallId, params) {
+        const query = String(params?.query || "").trim();
+        if (!query) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: "query parameter is required", disabled: false }) }],
+          };
+        }
+        const limit = Number(params?.maxResults) || cfg.topK || 8;
+
+        try {
+          const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+          const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: "main" };
+          const res = spawnSync(
+            cfg.pythonBin,
+            [script, "query", query, "--agent", "main", "--limit", String(limit), "--json"],
+            { encoding: "utf8", env, timeout: 15000 }
+          );
+
+          if (res.status !== 0) {
+            const stderr = String(res.stderr || "").trim().slice(0, 300);
+            log(cfg, "error", "memory_search (engram) failed", { stderr });
+            return {
+              content: [{ type: "text", text: JSON.stringify({ ok: false, error: "search failed", disabled: false, stderr }) }],
+            };
+          }
+
+          const raw = String(res.stdout || "").trim();
+          const jsonStart = raw.lastIndexOf("\n{");
+          const jsonStr = jsonStart >= 0 ? raw.slice(jsonStart + 1) : raw;
+          let parsed;
+          try { parsed = JSON.parse(jsonStr); } catch { parsed = { facts: [], entities: [], episodes: [], ok: false }; }
+
+          // Merge facts + entities + episodes into unified results array
+          const facts = (parsed.facts || []).map((r) => ({
+            path: "engram://facts",
+            score: r.importance ?? 0.5,
+            snippet: r.content || r.fact || String(r),
+            source: r.source_type || "graph",
+            agent: r.agent_id || "main",
+          }));
+          const entities = (parsed.entities || []).map((r) => ({
+            path: "engram://entities",
+            score: r.importance ?? 0.6,
+            snippet: r.name ? `${r.name}${r.summary ? ": " + r.summary : ""}` : String(r),
+            source: "entity",
+            agent: "main",
+          }));
+          const episodes = (parsed.episodes || []).map((r) => ({
+            path: `engram://episodes/${r.source_file || ""}`,
+            score: r.importance ?? 0.4,
+            snippet: r.summary || String(r),
+            source: "episode",
+            agent: "main",
+          }));
+          // Interleave: facts first (most relevant), then entities, then episodes
+          const results = [...facts, ...entities, ...episodes].slice(0, 15);
+
+          return {
+            content: [{ type: "text", text: JSON.stringify({ results, provider: "engram-neo4j", ok: true }) }],
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ results: [], ok: false, error: String(err), disabled: false }) }],
+          };
+        }
+      },
+    },
+    { names: ["memory_search"] }
+  );
+
+  // memory_get — read a specific memory file (falls back to file system, same as memory-core)
+  api.registerTool(
+    {
+      name: "memory_get",
+      label: "Memory Get (Engram)",
+      description:
+        "Read a specific memory file (e.g. MEMORY.md, memory/2026-03-23.md). " +
+        "Use after memory_search when you need the full content of a specific file.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relative path to the memory file (e.g. 'MEMORY.md', 'memory/2026-03-23.md')",
+          },
+          from: {
+            type: "number",
+            description: "Line number to start reading from (1-indexed, optional)",
+          },
+          lines: {
+            type: "number",
+            description: "Number of lines to read (optional, reads all if omitted)",
+          },
+        },
+        required: ["path"],
+      },
+      async execute(_toolCallId, params) {
+        const relPath = String(params?.path || "").trim();
+        if (!relPath) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ path: "", text: "", disabled: true, error: "path is required" }) }],
+          };
+        }
+
+        try {
+          const workspaceRoot = cfg.workspaceRoot || process.env.HOME + "/clawd";
+          const fullPath = path.isAbsolute(relPath) ? relPath : path.join(workspaceRoot, relPath);
+          const rawContent = fs.readFileSync(fullPath, "utf8");
+          const allLines = rawContent.split("\n");
+
+          const fromLine = params?.from ? Number(params.from) : 1;
+          const lineCount = params?.lines ? Number(params.lines) : allLines.length;
+          const sliced = allLines.slice(fromLine - 1, fromLine - 1 + lineCount).join("\n");
+
+          return {
+            content: [{ type: "text", text: JSON.stringify({ path: relPath, text: sliced, disabled: false }) }],
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ path: relPath, text: "", disabled: true, error: String(err) }) }],
+          };
+        }
+      },
+    },
+    { names: ["memory_get"] }
+  );
+
+  log(cfg, "log", "registered memory_search and memory_get (Engram Neo4j backend)");
 
   api.registerContextEngine("engram-context-engine", () => {
     const engine = {
@@ -393,7 +890,14 @@ export default function register(api) {
 
       async bootstrap({ sessionId, sessionFile }) {
         return safeRun(cfg, "bootstrap", { bootstrapped: true, importedMessages: 0, reason: "engram-fallback" }, () => {
-          resolveAgentId(cfg, sessionId, sessionFile);
+          const agentId = resolveAgentId(cfg, sessionId, sessionFile);
+          // Warm pinned cache at session start so first assemble() is instant
+          if (!getCachedPinned(sessionId, cfg.pinnedCacheTtlMs)) {
+            const channelId = extractChannelId(sessionId);
+            const pinned = queryPinnedFacts(cfg, agentId, { channelId, sessionId });
+            setCachedPinned(sessionId, pinned, cfg.pinnedCacheTtlMs);
+            log(cfg, "debug", "bootstrap: warmed pinned cache", { agentId, count: pinned?.length || 0 });
+          }
           return { bootstrapped: true, importedMessages: 0, reason: "engram-direct" };
         });
       },
@@ -424,13 +928,9 @@ export default function register(api) {
             for (const msg of normalized) {
               // Only store user messages via live extraction — assistant messages are our own output
               if (msg?.role !== "user") continue;
-              const liveResult = storeLiveTurn(cfg, sessionId, agentId, msg);
-              if (
-                String(msg?.text || "").length > 30 &&
-                shouldStoreLiveTurn(msg) &&
-                Number(liveResult?.stored || 0) === 0 &&
-                liveResult?.reason === "no_candidates"
-              ) {
+              // Skip regex path — it produces low-quality facts (timestamps, decisions, noise).
+              // Go straight to LLM extraction for all substantial user messages.
+              if (String(msg?.text || "").length > 30 && shouldStoreLiveTurn(msg)) {
                 storeLiveLLM(cfg, sessionId, agentId, msg);
               }
             }
@@ -441,12 +941,63 @@ export default function register(api) {
 
       async assemble({ sessionId, messages }) {
         return safeRun(cfg, "assemble", { messages, estimatedTokens: 0 }, () => {
-          const searchTerms = buildSearchTerms(messages);
-          if (!searchTerms || searchTerms.length < 3) return { messages, estimatedTokens: 0 };
           const agentId = resolveAgentId(cfg, sessionId, null);
-          const results = queryEngramMulti(cfg, searchTerms, agentId);
-          const addition = formatEngramResults(results);
-          return { messages, estimatedTokens: 0, systemPromptAddition: cfg.includeSystemPromptAddition ? addition : undefined };
+          const channelId = extractChannelId(sessionId);
+
+          // ── 1. Pinned facts: cached per-session, TTL 10 min ──────────────
+          let pinned = getCachedPinned(sessionId, cfg.pinnedCacheTtlMs);
+          if (!pinned) {
+            pinned = queryPinnedFacts(cfg, agentId, { channelId, sessionId });
+            setCachedPinned(sessionId, pinned, cfg.pinnedCacheTtlMs);
+            log(cfg, "debug", "assemble: pinned cache miss — queried Neo4j");
+          } else {
+            log(cfg, "debug", "assemble: pinned cache hit");
+          }
+
+          const pinnedLines = [];
+          const pinnedSeen = new Set();
+          for (const p of (pinned || [])) {
+            const text = String(p?.content || "").trim();
+            if (text && !pinnedSeen.has(text)) {
+              pinnedSeen.add(text);
+              pinnedLines.push(`- ${text}`);
+            }
+          }
+
+          // ── 2. Context query: skip if same terms & within TTL ────────────
+          const searchTerms = buildSearchTerms(messages);
+          const termsHash = hashTerms(searchTerms);
+          let queryAddition = "";
+
+          if (searchTerms && searchTerms.length >= 3) {
+            const cached = getCachedAssembly(sessionId, termsHash, cfg.assembleCacheTtlMs);
+            if (cached !== null) {
+              log(cfg, "debug", "assemble: context cache hit", { termsHash });
+              queryAddition = cached;
+            } else {
+              log(cfg, "debug", "assemble: context cache miss — querying Neo4j", { termsHash });
+              const results = queryEngramMulti(cfg, searchTerms, agentId);
+              if (results && typeof results === "object") {
+                const facts = Array.isArray(results.facts)
+                  ? results.facts.filter((f) => !pinnedSeen.has(String(f?.content || "").trim()))
+                  : [];
+                results.facts = facts;
+              }
+              queryAddition = formatEngramResults(results);
+              setCachedAssembly(sessionId, termsHash, queryAddition, cfg.assembleCacheTtlMs);
+            }
+          }
+
+          const parts = [];
+          if (pinnedLines.length) {
+            parts.push("Standing rules:\n" + pinnedLines.join("\n"));
+          }
+          if (queryAddition) {
+            parts.push(queryAddition);
+          }
+          const addition = parts.join("\n\n");
+
+          return { messages, estimatedTokens: 0, systemPromptAddition: cfg.includeSystemPromptAddition && addition ? addition : undefined };
         });
       },
 
@@ -499,14 +1050,14 @@ export default function register(api) {
             lines.push(String(summary || "No summary generated."));
             lines.push("");
 
-            // Include key user messages for richer context
-            const userMsgs = olderMessages.filter((m) => m.role === "user");
+            // Include key user messages for richer context (skip envelope noise)
+            const userMsgs = olderMessages.filter((m) => m.role === "user" && !isEnvelopeNoise(m.text));
             if (userMsgs.length) {
               lines.push("## Key Messages");
               for (const m of userMsgs.slice(-8)) {
                 const text = String(m.text || "").trim();
-                if (text && text.length > 20 && text.length < 500) {
-                  lines.push(`- [${m.role}] ${text.slice(0, 250)}`);
+                if (text && text.length > 20 && text.length < 400) {
+                  lines.push(`- [${m.role}] ${text.slice(0, 240)}`);
                 }
               }
               lines.push("");
