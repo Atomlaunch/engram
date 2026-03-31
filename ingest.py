@@ -408,6 +408,15 @@ def classify_source(filepath: Path, text: str = "") -> dict:
         source_type = "memory"
         memory_tier = "candidate"
         quality_score = 0.65
+        # Exported session transcripts and compaction flush files are session dumps —
+        # they've already been processed via live_llm extraction during the session.
+        # Treat them as low-priority to avoid double-storing the same conversations.
+        if re.match(r"\d{4}-\d{2}-\d{2}-(main|loopfans|sillyfarms|sillysupport)-[a-f0-9]+\.md$", name):
+            source_type = "exported_session"
+            memory_tier = "archive"
+            quality_score = 0.15
+            contamination_score += 0.5
+            retrievable = False
 
     if re.match(r"\d{4}-\d{2}-\d{2}(-[a-z0-9_-]+-[a-f0-9]+)?\.md$", name):
         contamination_score += 0.05
@@ -684,6 +693,17 @@ def store_extraction(conn: kuzu.Connection, extraction: dict,
         
         fid = generate_id("fact", content.lower())
         
+        # Skip if a higher-quality live_llm fact with same id already exists
+        try:
+            existing = conn.execute(
+                "MATCH (f:Fact {id: $p_id}) WHERE f.source_type = 'live_llm' RETURN f.id",
+                {"p_id": fid}
+            )
+            if existing.has_next():
+                continue  # live_llm already captured this — skip batch duplicate
+        except Exception:
+            pass
+        
         try:
             conn.execute(
                 "MERGE (f:Fact {id: $p_id}) "
@@ -820,6 +840,12 @@ def ingest_file(conn: kuzu.Connection, filepath: Path, force: bool = False):
         print("   (empty file, skipping)")
         return
     
+    # Skip exported session transcripts — already processed via live_llm during the session
+    source_meta = classify_source(filepath, text)
+    if source_meta.get("source_type") == "exported_session" and not force:
+        print("   (exported session transcript, skipping — already live-extracted)")
+        return
+    
     date_str = extract_date_from_filename(filepath)
     chunks = chunk_text(text)
     
@@ -871,6 +897,10 @@ def _extract_file(filepath: Path) -> dict:
             return result
 
         result["source_meta"] = classify_source(filepath, text)
+        
+        # Skip exported session transcripts — already processed via live_llm
+        if result["source_meta"].get("source_type") == "exported_session":
+            return result
         
         chunks = chunk_text(text)
         
