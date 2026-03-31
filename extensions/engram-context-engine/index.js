@@ -205,7 +205,7 @@ function shouldStoreLiveTurn(msg) {
   const role = String(msg?.role || "").trim();
   const text = String(msg?.text || "").trim();
   if (!text || text.length < 20) return false;
-  if (role !== "user") return false;
+  if (role !== "user" && role !== "assistant") return false;
   if (text === "NO_REPLY" || text === "HEARTBEAT_OK") return false;
   const lower = text.toLowerCase();
   if (lower.includes("heartbeat") && text.length < 80) return false;
@@ -213,6 +213,56 @@ function shouldStoreLiveTurn(msg) {
   // Only filter pure noise that has no human content at all.
   if (lower.includes("toolcall") || lower.includes("toolresult")) return false;
   return true;
+}
+
+function detectMemoryMode(sessionId, messages = []) {
+  const sid = String(sessionId || "").toLowerCase();
+  const recentText = normalizeMessages(messages).slice(-4).map((m) => m.text).join("\n").toLowerCase();
+
+  if (sid.includes(":cron:") || sid.includes(":subagent:") || sid.includes(":acp:")) {
+    return "outcome";
+  }
+
+  const sensitiveSignals = [
+    "support request",
+    "prompt injection",
+    "x-api-key",
+    "authorization:",
+    "api key:",
+    "customer-provided content",
+    "webhook",
+    "email ingestion",
+    "external_untrusted_content",
+  ];
+  if (sensitiveSignals.some((s) => recentText.includes(s))) {
+    return "sensitive";
+  }
+
+  return "conversational";
+}
+
+function isHighSignalOutcomeEvent(text) {
+  const t = String(text || "").toLowerCase();
+  if (!t || t.length < 24) return false;
+  return [
+    "fixed",
+    "failed because",
+    "root cause",
+    "blocked",
+    "disabled",
+    "enabled",
+    "shipped",
+    "migrated",
+    "deployed",
+    "decision",
+    "decided",
+    "next step",
+    "pending",
+    "workaround",
+    "constraint",
+    "discovered",
+    "lesson",
+  ].some((needle) => t.includes(needle));
 }
 
 function storeLiveTurn(cfg, sessionId, agentId, msg) {
@@ -262,27 +312,45 @@ function extractSpeakerFromText(text) {
   return null;
 }
 
-function storeLiveLLM(cfg, sessionId, agentId, msg) {
+function storeLiveLLM(cfg, sessionId, agentId, msg, memoryMode = "conversational") {
   return safeRun(cfg, "storeLiveLLM", undefined, () => {
     if (msg?.role !== "user") return undefined;
     if (!shouldStoreLiveTurn(msg)) return undefined;
     if (String(msg?.text || "").length <= 30) return undefined;
     const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
     const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
-    // Extract speaker from envelope metadata so facts are attributed to the real human name
     const speaker = extractSpeakerFromText(msg.text);
-    const args = [script, "extract_llm", "--text", msg.text, "--agent", agentId, "--session", sessionId];
+    const args = [script, "extract_llm", "--text", msg.text, "--agent", agentId, "--session", sessionId, "--mode", memoryMode];
     if (speaker) args.push("--speaker", speaker);
-    const child = spawn(
-      cfg.pythonBin,
-      args,
-      { env, stdio: "ignore", detached: true }
-    );
-    child.on("error", (err) => {
-      log(cfg, "error", "extract_llm spawn failed", { error: String(err) });
-    });
+    const child = spawn(cfg.pythonBin, args, { env, stdio: "ignore", detached: true });
+    child.on("error", (err) => { log(cfg, "error", "extract_llm spawn failed", { error: String(err) }); });
     child.unref();
-    return { started: true };
+
+    // Auto-enrich person entity for conversational sessions with a known speaker
+    if (speaker && memoryMode === "conversational" && String(msg?.text || "").length > 60) {
+      // Strip envelope metadata before passing as detail — avoid storing raw Discord JSON
+      const rawDetail = String(msg.text || "");
+      const cleanDetail = rawDetail
+        .replace(/Conversation info \(untrusted metadata\):\s*```json\s*\{[\s\S]*?\}\s*```\s*/g, '')
+        .replace(/Sender \(untrusted metadata\):\s*```json\s*\{[\s\S]*?\}\s*```\s*/g, '')
+        .replace(/Replied message \(untrusted[^)]*\):\s*```json\s*\{[\s\S]*?\}\s*```\s*/g, '')
+        .replace(/\[Thread starter - for context\]\s*/g, '')
+        .replace(/<<<EXTERNAL_UNTRUSTED_CONTENT[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\s*/g, '')
+        .replace(/```json\s*\{[^}]*(?:"message_id"|"sender_id")[^}]*\}\s*```/g, '')
+        .trim();
+      if (!cleanDetail || cleanDetail.length < 10) {
+        // Nothing left after stripping — skip enrichment
+      } else {
+      const enrichArgs = [script, "auto_enrich", "--agent", agentId, "--session", sessionId,
+        "--name", speaker, "--type", "interacted",
+        "--detail", cleanDetail.slice(0, 200)];
+      const enrichChild = spawn(cfg.pythonBin, enrichArgs, { env, stdio: "ignore", detached: true });
+      enrichChild.on("error", () => {});
+      enrichChild.unref();
+      } // end else (cleanDetail long enough)
+    }
+
+    return { started: true, memoryMode };
   });
 }
 
@@ -509,27 +577,131 @@ function bulletize(lines) {
   return clean.slice(0, 8).map((s) => `- ${s}`);
 }
 
-function buildStructuredCompactionSummary(messages) {
+function extractOutcomeSummaryFields(messages) {
   const items = Array.isArray(messages) ? messages : [];
-  // Filter envelope noise before building summary bullets
   const clean = (msgs) => msgs.filter((t) => !isEnvelopeNoise(t));
+  const all = clean(items.map((m) => String(m.text || "").trim()).filter(Boolean));
   const userMsgs = clean(items.filter((m) => m.role === "user").map((m) => m.text));
   const asstMsgs = clean(items.filter((m) => m.role === "assistant").map((m) => m.text));
+
   const objective = bulletize(userMsgs.slice(-3).map((t) => summarizeRecord({ text: t })));
   const established = bulletize(asstMsgs.slice(-5).map((t) => summarizeRecord({ text: t })));
   const decisions = bulletize(
-    clean(items.map((m) => m.text))
-      .filter((t) => /decid|will do|going to|fixed|changed|disabled|enabled/i.test(t))
+    all
+      .filter((t) => /decid|will do|going to|fixed|changed|disabled|enabled|shipped|migrated|deployed/i.test(t))
       .map((t) => summarizeRecord({ text: t }))
       .slice(-6)
   );
   const openLoops = bulletize(
-    clean(items.map((m) => m.text))
+    all
       .filter((t) => /todo|next|need to|follow up|pending|block|later/i.test(t))
       .map((t) => summarizeRecord({ text: t }))
       .slice(-6)
   );
+  const blockers = bulletize(
+    all
+      .filter((t) => /failed|error|blocked|root cause|aborted|timeout|unavailable|could not|unable to/i.test(t))
+      .map((t) => summarizeRecord({ text: t }))
+      .slice(-6)
+  );
+
+  return { objective, established, decisions, openLoops, blockers };
+}
+
+function buildStructuredCompactionSummary(messages) {
+  const { objective, established, decisions, openLoops } = extractOutcomeSummaryFields(messages);
   return ["Compacted session state", "", "Objective:", ...objective, "", "Established facts:", ...established, "", "Decisions made:", ...decisions, "", "Open loops:", ...openLoops].join("\n");
+}
+
+function buildCanonicalOutcomeSummary(sessionId, messages) {
+  const { objective, decisions, openLoops, blockers } = extractOutcomeSummaryFields(messages);
+  const sid = String(sessionId || "").toLowerCase();
+  const allText = normalizeMessages(messages).map((m) => m.text).join("\n").toLowerCase();
+  const failed = /failed|error|blocked|aborted|timeout|unavailable|could not|unable to/.test(allText);
+  const status = failed ? "failed" : "completed";
+  const label = sid.includes(":cron:") ? "Cron run summary" : sid.includes(":subagent:") ? "Worker run summary" : "Run summary";
+  const lines = [label, `Status: ${status}`];
+  if (objective.length && objective[0] !== "- None") lines.push("Objective: " + objective.map((s) => s.replace(/^[-]\s*/, "")).join(" | "));
+  if (blockers.length && blockers[0] !== "- None") lines.push((failed ? "Failure: " : "Blockers: ") + blockers.map((s) => s.replace(/^[-]\s*/, "")).join(" | "));
+  if (decisions.length && decisions[0] !== "- None") lines.push("Decisions: " + decisions.map((s) => s.replace(/^[-]\s*/, "")).join(" | "));
+  if (openLoops.length && openLoops[0] !== "- None") lines.push("Open loops: " + openLoops.map((s) => s.replace(/^[-]\s*/, "")).join(" | "));
+  return lines.join("\n");
+}
+
+function storeOutcomeSummaryMemory(cfg, sessionId, agentId, summary) {
+  return safeRun(cfg, "storeOutcomeSummaryMemory", undefined, () => {
+    const text = String(summary || "").trim();
+    if (!text || text.length < 40) return undefined;
+    const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+    const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
+    const res = spawnSync(
+      cfg.pythonBin,
+      [script, "extract_llm", "--text", text, "--agent", agentId, "--session", sessionId, "--mode", "outcome"],
+      { encoding: "utf8", env, timeout: 15000 }
+    );
+    if (res.status !== 0) {
+      log(cfg, "error", "storeOutcomeSummaryMemory failed", { status: res.status, stderr: String(res.stderr || "").trim().slice(0, 400) });
+      return undefined;
+    }
+    return true;
+  });
+}
+
+function storeSessionHandoff(cfg, sessionId, agentId, fields = {}) {
+  return safeRun(cfg, "storeSessionHandoff", undefined, () => {
+    const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+    const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
+    const args = [script, "store_handoff", "--agent", agentId, "--session", sessionId];
+    if (fields.project) args.push("--project", String(fields.project));
+    if (fields.worked_on) args.push("--worked_on", String(fields.worked_on).slice(0, 300));
+    if (fields.changed) args.push("--changed", String(fields.changed).slice(0, 300));
+    if (fields.pending) args.push("--pending", String(fields.pending).slice(0, 300));
+    if (fields.lessons) args.push("--lessons", String(fields.lessons).slice(0, 300));
+    const res = spawnSync(cfg.pythonBin, args, { encoding: "utf8", env, timeout: 10000 });
+    if (res.status !== 0) {
+      log(cfg, "error", "storeSessionHandoff failed", { status: res.status, stderr: String(res.stderr || "").trim().slice(0, 300) });
+      return undefined;
+    }
+    return true;
+  });
+}
+
+function buildHandoffFields(messages) {
+  const fields = extractOutcomeSummaryFields(messages);
+  return {
+    worked_on: fields.objective.map((s) => s.replace(/^[-]\s*/, "")).filter(Boolean).join("; "),
+    changed: fields.decisions.map((s) => s.replace(/^[-]\s*/, "")).filter(Boolean).join("; "),
+    pending: fields.openLoops.map((s) => s.replace(/^[-]\s*/, "")).filter(Boolean).join("; "),
+    lessons: fields.established.map((s) => s.replace(/^[-]\s*/, "")).filter(Boolean).slice(0, 3).join("; "),
+  };
+}
+
+function queryProjectBootstrap(cfg, agentId, projectLabel) {
+  return safeRun(cfg, "queryProjectBootstrap", [], () => {
+    const script = path.join(cfg.workspaceRoot, "engram", "context_query.py");
+    const env = { ...process.env, PYTHONPATH: cfg.workspaceRoot, ENGRAM_AGENT_ID: agentId };
+    const args = [script, "bootstrap_project", "--agent", agentId, "--limit", "8"];
+    if (projectLabel) args.push("--project", projectLabel);
+    const res = spawnSync(cfg.pythonBin, args, { encoding: "utf8", env, timeout: 10000 });
+    if (res.status !== 0) return [];
+    const out = String(res.stdout || "").trim();
+    if (!out) return [];
+    try {
+      const parsed = JSON.parse(out);
+      return Array.isArray(parsed?.facts) ? parsed.facts : [];
+    } catch { return []; }
+  });
+}
+
+const _projectLabelMap = {
+  sillyfarms: "SillyFarms",
+  loopfans: "LoopFans",
+  sillysupport: "SillyFarms Support",
+  main: null,
+};
+
+function guessProjectLabel(agentId) {
+  return _projectLabelMap[agentId] || null;
 }
 
 function buildCompactedMessages(summary, recentTail) {
@@ -898,6 +1070,16 @@ export default function register(api) {
             setCachedPinned(sessionId, pinned, cfg.pinnedCacheTtlMs);
             log(cfg, "debug", "bootstrap: warmed pinned cache", { agentId, count: pinned?.length || 0 });
           }
+          // Pre-fetch project bootstrap for project-bound agents
+          const projectLabel = guessProjectLabel(agentId);
+          if (projectLabel) {
+            const projectFacts = queryProjectBootstrap(cfg, agentId, projectLabel);
+            if (projectFacts.length) {
+              // Cache under a special session key so assemble() can use it
+              _assembleCache.set(`bootstrap:${sessionId}`, { facts: projectFacts, expiresAt: Date.now() + 15 * 60 * 1000 });
+              log(cfg, "debug", "bootstrap: loaded project memory", { agentId, project: projectLabel, count: projectFacts.length });
+            }
+          }
           return { bootstrapped: true, importedMessages: 0, reason: "engram-direct" };
         });
       },
@@ -923,15 +1105,30 @@ export default function register(api) {
           const agentId = resolveAgentId(cfg, sessionId, sessionFile);
           const newMessages = Array.isArray(messages) ? messages.slice(Math.max(0, prePromptMessageCount || 0)) : [];
           const normalized = normalizeMessages(newMessages);
+          const memoryMode = detectMemoryMode(sessionId, normalized);
           if (normalized.length) {
             persistMessages(cfg, sessionId, agentId, normalized, "afterTurn");
             for (const msg of normalized) {
-              // Only store user messages via live extraction — assistant messages are our own output
-              if (msg?.role !== "user") continue;
-              // Skip regex path — it produces low-quality facts (timestamps, decisions, noise).
-              // Go straight to LLM extraction for all substantial user messages.
-              if (String(msg?.text || "").length > 30 && shouldStoreLiveTurn(msg)) {
-                storeLiveLLM(cfg, sessionId, agentId, msg);
+              // Store user messages and high-signal assistant messages
+              const role = msg?.role || "";
+              if (role !== "user" && role !== "assistant") continue;
+              if (!(String(msg?.text || "").length > 30 && shouldStoreLiveTurn(msg))) continue;
+              // For assistant messages, only extract if they contain durable decisions/outcomes
+              if (role === "assistant" && !isHighSignalOutcomeEvent(msg.text)) continue;
+
+              if (memoryMode === "conversational") {
+                storeLiveLLM(cfg, sessionId, agentId, msg, memoryMode);
+                continue;
+              }
+
+              if (memoryMode === "sensitive") {
+                // Let Python sanitize aggressively; only send substantial messages.
+                storeLiveLLM(cfg, sessionId, agentId, msg, memoryMode);
+                continue;
+              }
+
+              if (memoryMode === "outcome" && isHighSignalOutcomeEvent(msg.text)) {
+                storeLiveLLM(cfg, sessionId, agentId, msg, memoryMode);
               }
             }
           }
@@ -992,6 +1189,19 @@ export default function register(api) {
           if (pinnedLines.length) {
             parts.push("Standing rules:\n" + pinnedLines.join("\n"));
           }
+
+          // Inject project bootstrap memory for project-bound agents
+          const bootstrapEntry = _assembleCache.get(`bootstrap:${sessionId}`);
+          if (bootstrapEntry && Date.now() < bootstrapEntry.expiresAt && Array.isArray(bootstrapEntry.facts) && bootstrapEntry.facts.length) {
+            const bLines = ["Project memory:"];
+            const bSeen = new Set();
+            for (const f of bootstrapEntry.facts.slice(0, 6)) {
+              const txt = String(f?.content || "").trim();
+              if (txt && !bSeen.has(txt)) { bSeen.add(txt); bLines.push(`- ${txt}`); }
+            }
+            if (bLines.length > 1) parts.push(bLines.join("\n"));
+          }
+
           if (queryAddition) {
             parts.push(queryAddition);
           }
@@ -1009,6 +1219,7 @@ export default function register(api) {
           const agentId = resolveAgentId(cfg, sessionId, sessionFile || null);
           const transcript = loadSessionTranscript(cfg, sessionId, sessionFile || null);
           const normalized = stripCompactionNoise(normalizeTranscriptMessages(transcript));
+          const memoryMode = detectMemoryMode(sessionId, normalized);
           const { olderMessages, recentTail } = splitTranscriptForCompaction(normalized, { keepRecentMessages: cfg.keepRecentMessages || 12 });
           if (!olderMessages.length) {
             return { ok: true, compacted: false, reason: `Engram found too little older history to compact for ${sessionId}.` };
@@ -1019,6 +1230,19 @@ export default function register(api) {
           const messages = buildCompactedMessages(summary, recentTail);
           const tokensBefore = estimateTokenCountFromText(olderMessages.map((m) => m.text).join("\n"));
           const tokensAfter = estimateTokenCountFromText(messages.map((m) => String(m.content || "")).join("\n"));
+
+          if (memoryMode === "outcome" || memoryMode === "sensitive") {
+            const canonicalSummary = buildCanonicalOutcomeSummary(sessionId, olderMessages);
+            storeOutcomeSummaryMemory(cfg, sessionId, agentId, canonicalSummary);
+          }
+
+          // Store session handoff record for agent continuity across sessions
+          const handoffFields = buildHandoffFields(normalized);
+          const projectLabel = guessProjectLabel(agentId);
+          if (projectLabel) handoffFields.project = projectLabel;
+          if (handoffFields.worked_on || handoffFields.pending || handoffFields.changed) {
+            storeSessionHandoff(cfg, sessionId, agentId, handoffFields);
+          }
 
           // Write compaction summary to memory/*.md so cron pipeline can ingest it
           try {
@@ -1069,7 +1293,7 @@ export default function register(api) {
             log(cfg, "error", "compact: memory flush write failed", { error: String(flushErr) });
           }
 
-          return { ok: true, compacted: true, result: { tokensBefore, tokensAfter, summary, messages, durableMemoriesPersisted: durable.length, recentTailMessages: recentTail.length, compactedOlderMessages: olderMessages.length } };
+          return { ok: true, compacted: true, result: { tokensBefore, tokensAfter, summary, messages, durableMemoriesPersisted: durable.length, recentTailMessages: recentTail.length, compactedOlderMessages: olderMessages.length, memoryMode } };
         });
       },
 
