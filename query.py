@@ -161,7 +161,7 @@ def search_facts(conn: kuzu.Connection, query: str, limit: int = 10,
             "WHERE lower(f.content) CONTAINS lower($p_q)"
             " AND coalesce(f.retrievable, true) = true"
             + agent_filter +
-            " RETURN f.id, f.content, f.category, f.confidence, f.importance, f.valid_at, f.memory_tier, f.quality_score, f.contamination_score, f.retrievable, f.source_type, f.created_at "
+            " RETURN f.id, f.content, f.category, f.confidence, f.importance, f.valid_at, f.memory_tier, f.quality_score, f.contamination_score, f.retrievable, f.source_type, f.created_at, f.artifact_type, f.memory_mode, f.status "
             "ORDER BY coalesce(f.is_canonical, false) DESC, coalesce(f.quality_score, f.importance, 0) DESC, f.importance DESC LIMIT $p_lim",
             params
         )
@@ -171,7 +171,8 @@ def search_facts(conn: kuzu.Connection, query: str, limit: int = 10,
                 "id": row[0], "content": row[1], "category": row[2],
                 "confidence": row[3], "importance": row[4], "valid_at": str(row[5]),
                 "memory_tier": row[6], "quality_score": row[7], "contamination_score": row[8], "retrievable": row[9],
-                "source_type": row[10] if len(row) > 10 else None, "created_at": row[11] if len(row) > 11 else None
+                "source_type": row[10] if len(row) > 10 else None, "created_at": row[11] if len(row) > 11 else None,
+                "artifact_type": row[12] if len(row) > 12 else None, "memory_mode": row[13] if len(row) > 13 else None, "status": row[14] if len(row) > 14 else None
             })
     except Exception as e:
         print(f"Fact search error: {e}")
@@ -317,7 +318,7 @@ def get_entity_context(conn: kuzu.Connection, entity_name: str) -> dict:
     try:
         result = conn.execute(
             "MATCH (f:Fact)-[:ABOUT]->(e:Entity {id: $p_id}) "
-            "RETURN f.id, f.content, f.category, f.confidence, f.valid_at",
+            "RETURN f.id, f.content, f.category, f.confidence, f.valid_at, f.artifact_type, f.memory_mode, f.status",
             {"p_id": eid}
         )
         fact_ids = []
@@ -326,7 +327,8 @@ def get_entity_context(conn: kuzu.Connection, entity_name: str) -> dict:
             fact_ids.append(row[0])
             context["facts"].append({
                 "id": row[0], "content": row[1], "category": row[2],
-                "confidence": row[3], "valid_at": str(row[4])
+                "confidence": row[3], "valid_at": str(row[4]),
+                "artifact_type": row[5], "memory_mode": row[6], "status": row[7]
             })
         # Reinforce accessed facts (non-blocking)
         _reinforce_nodes(conn, "Fact", fact_ids)
