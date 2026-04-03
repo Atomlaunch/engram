@@ -1,0 +1,13 @@
+{
+  "vault_path": "~/obsidian-vault",
+  "index_db": "~/.engram/vault_index.db",
+  "ingest_interval_minutes": 60,
+  "llm_model": "claude-haiku-4-5",
+  "llm_provider": "anthropic",
+  "ingest_sources": ["Daily", "Projects"],
+  "min_confidence": 0.6,
+  "briefing_max_facts": 15,
+  "briefing_max_entities": 10,
+  "log_level": "info",
+  "log_path": "~/.engram/engram.log"
+}

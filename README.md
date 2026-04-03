@@ -1,80 +1,79 @@
-# Engram — Graph Memory for OpenClaw Agents
+# Engram
 
-Engram is a temporal knowledge graph memory system for [OpenClaw](https://github.com/openclaw/openclaw) agents. It extracts entities, facts, relationships, and emotions from session logs, stores them in a [Kuzu](https://kuzudb.com) graph database, and injects relevant context into every conversation turn.
-
-## Features
-
-- **Multi-agent memory isolation** — Each agent's facts scoped by `agent_id`
-- **Parallel ingest** — 6+ workers for LLM extraction (~10 files/min)
-- **Context engine plugin** — Injects graph facts into OpenClaw agent context per turn
-- **Entity deduplication** — Normalize and merge duplicate entities
-- **Interactive dashboard** — Sigma.js graph visualization with per-agent filtering
-- **Hourly sync** — Cron-based export → ingest → briefing pipeline
-- **Semantic + graph search** — Kuzu graph queries + Chroma vector embeddings
+Jarvis's persistent memory system. Obsidian-native, SQLite-indexed, zero heavy dependencies.
 
 ## Architecture
 
-```
-Session JSONL → Export → Markdown → LLM Extraction → Kuzu Graph DB
-                                                          ↓
-                                          Context Engine Plugin → Agent turns
-                                                          ↓
-                                              Dashboard (optional)
-```
+- **Source of truth**: Obsidian vault (markdown files with YAML frontmatter)
+- **Query layer**: SQLite FTS5 index, rebuilt incrementally on change
+- **Live sync**: watchdog file watcher (inotify on Linux)
+- **Ingest**: LLM extraction pipeline writes Entity + Fact notes back to vault
+- **Briefing**: session start injection with standing rules, open loops, recent context
 
-## Components
-
-| Directory | Description |
-|---|---|
-| `*.py` (root) | Core: ingest, query, schema, export, dedup, consolidation |
-| `dashboard/` | FastAPI + Sigma.js visualization with agent filtering |
-| `extensions/context-engine/` | OpenClaw plugin for context injection |
-| `skills/engram/` | Setup guide as an OpenClaw skill |
-
-## Quick Start
-
-See [`skills/engram/SKILL.md`](skills/engram/SKILL.md) for full setup instructions.
+## Install
 
 ```bash
-# Install dependencies
-python3 -m venv .venv-memory
-source .venv-memory/bin/activate
-pip install kuzu chromadb
-
-# Export sessions and run ingest
-python export_sessions.py
-python ingest.py --workers 6
-
-# Query
-python context_query.py query "search terms" --agent main
+git clone https://github.com/atomlaunch/engram.git
+cd engram
+pip install -e .
 ```
 
-## Schema
-
-**Nodes:** Entity, Fact, Episode, Emotion, SessionState  
-**Relationships:** RELATES_TO, CAUSED, PART_OF, MENTIONED_IN, EPISODE_EVOKES, ENTITY_EVOKES, DERIVED_FROM, ABOUT
-
-Every node has an `agent_id` field for multi-agent isolation.
-
-## Dashboard
+## Setup
 
 ```bash
-cd dashboard
-npm install && npm run bundle
-pm2 start ecosystem.config.js
-# → http://localhost:3847
+# Copy config template
+mkdir -p ~/.engram
+cp config.example.json ~/.engram/config.json
+# Edit vault_path and other settings
+
+# Copy AGENTS.md to vault root
+cp templates/AGENTS.md ~/obsidian-vault/AGENTS.md
+
+# Build initial index
+engram index
 ```
 
-Features: graph visualization, per-agent filtering, entity search, node detail view, connection explorer.
+## Usage
+
+```bash
+engram index              # Scan vault and build index
+engram index --watch      # Keep running and watch for changes
+engram brief              # Print session briefing
+engram search "discord"   # Full-text search
+engram search "rule" --type fact
+engram ingest             # Run LLM extraction pipeline
+engram session "Summary of what happened" --threads "item1,item2"
+engram version            # Version + index stats
+```
+
+## Note Types
+
+- **entity** -- people, projects, tools, concepts (Memory/Entities/)
+- **fact** -- decisions, preferences, rules, lessons (Memory/Facts/)
+- **session** -- session snapshots (Memory/Sessions/)
+
+## Artifact Types (Facts)
+
+| Type | Description |
+|------|-------------|
+| durable_fact | Stable truth, long shelf life |
+| preference | How TheDev likes things done |
+| standing_rule | Always apply (importance: 1.0) |
+| decision | Something decided with context |
+| lesson | Learned from failure or success |
+| open_loop | Unresolved thread to revisit |
+| constraint | Hard limit or boundary |
+
+## Versioning
+
+Semver. Each release tagged on GitHub. Schema migrations in `migrations/`.
+
+See [CHANGELOG.md](CHANGELOG.md) for full history.
 
 ## Requirements
 
-- Python 3.10+
-- Node.js 18+ (dashboard only)
-- [Kuzu](https://kuzudb.com) (via pip)
-- LLM API access (xAI/Grok by default, configurable)
-- [OpenClaw](https://github.com/openclaw/openclaw) (for context engine plugin)
-
-## License
-
-MIT
+- Python >= 3.11
+- watchdog >= 4.0
+- python-frontmatter >= 1.1
+- anthropic >= 0.40 (for ingest pipeline)
+- click >= 8.1

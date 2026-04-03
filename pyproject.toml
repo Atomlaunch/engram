@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engram"
+version = "1.0.0"
+description = "Jarvis persistent memory system — Obsidian-native, SQLite-indexed"
+requires-python = ">=3.11"
+dependencies = [
+    "watchdog>=4.0",
+    "python-frontmatter>=1.1",
+    "anthropic>=0.40",
+    "click>=8.1",
+]
+
+[project.scripts]
+engram = "engram.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["engram*"]
