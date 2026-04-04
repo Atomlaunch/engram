@@ -20,6 +20,14 @@ from .schema import init_db, get_meta, set_meta
 
 logger = logging.getLogger("engram.indexer")
 
+
+def _text(value) -> str:
+    """Coerce a value to a SQLite-safe text string."""
+    if value is None:
+        return ""
+    return str(value)
+
+
 # Fields we store as columns (everything else goes into FTS body)
 FRONTMATTER_COLS = {
     "type", "entity_type", "artifact_type",
@@ -42,23 +50,23 @@ def _parse_note(path: str, vault_root: str):
     meta = post.metadata
     body = post.content
 
-    note_type = meta.get("type", _infer_type(rel_path))
-    subtype = meta.get("artifact_type") or meta.get("entity_type")
+    note_type = _text(meta.get("type", _infer_type(rel_path)))
+    subtype = _text(meta.get("artifact_type") or meta.get("entity_type"))
 
     # Title: frontmatter title > name (for entities) > first H1 > filename stem
-    title = meta.get("title") or meta.get("name") or _extract_h1(body) or Path(path).stem
+    title = _text(meta.get("title") or meta.get("name") or _extract_h1(body) or Path(path).stem)
 
     tags_raw = meta.get("tags", [])
     if isinstance(tags_raw, list):
-        tags = ",".join(str(t) for t in tags_raw)
+        tags = ",".join(_text(t) for t in tags_raw)
     else:
-        tags = str(tags_raw)
+        tags = _text(tags_raw)
 
     importance = float(meta.get("importance", 0.5))
     confidence = float(meta.get("confidence", 1.0))
-    status = meta.get("status", "active")
-    created = meta.get("created", "")
-    updated = meta.get("updated", "")
+    status = _text(meta.get("status", "active"))
+    created = _text(meta.get("created", ""))
+    updated = _text(meta.get("updated", ""))
 
     # Extract wikilinks from body + frontmatter arrays
     links = _extract_links(body, meta)
@@ -239,27 +247,32 @@ class _VaultEventHandler(FileSystemEventHandler):
         self.conn = conn
         self.vault_root = vault_root
         self._timers = {}
+        self._db_lock = threading.Lock()
+        self._timer_lock = threading.Lock()
 
     def _schedule(self, path: str, op: str):
-        if path in self._timers:
-            self._timers[path].cancel()
-        t = threading.Timer(0.5, self._handle, args=[path, op])
-        self._timers[path] = t
-        t.start()
+        with self._timer_lock:
+            if path in self._timers:
+                self._timers[path].cancel()
+            t = threading.Timer(0.5, self._handle, args=[path, op])
+            self._timers[path] = t
+            t.start()
 
     def _handle(self, path: str, op: str):
-        self._timers.pop(path, None)
+        with self._timer_lock:
+            self._timers.pop(path, None)
         rel = os.path.relpath(path, self.vault_root)
-        if op == "delete":
-            _delete_note(self.conn, rel)
-            self.conn.commit()
-            logger.debug(f"Removed: {rel}")
-        else:
-            note = _parse_note(path, self.vault_root)
-            if note:
-                _upsert_note(self.conn, note)
+        with self._db_lock:
+            if op == "delete":
+                _delete_note(self.conn, rel)
                 self.conn.commit()
-                logger.debug(f"Indexed: {rel}")
+                logger.debug(f"Removed: {rel}")
+            else:
+                note = _parse_note(path, self.vault_root)
+                if note:
+                    _upsert_note(self.conn, note)
+                    self.conn.commit()
+                    logger.debug(f"Indexed: {rel}")
 
     def on_modified(self, event):
         if not event.is_directory and event.src_path.endswith(".md"):
