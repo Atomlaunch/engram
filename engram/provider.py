@@ -226,7 +226,7 @@ class EngramMemoryProvider(_MemoryProvider):
 
     def _save_session_async(self, messages: List[Dict[str, Any]]) -> None:
         try:
-            import anthropic, re
+            import re, requests
 
             turns = []
             for m in messages:
@@ -243,7 +243,8 @@ class EngramMemoryProvider(_MemoryProvider):
                 return
 
             conversation = "\n\n".join(turns[-20:])
-            client = anthropic.Anthropic(api_key=api_key)
+            provider = self._cfg.get("llm_provider", "openai")
+            model = self._cfg.get("llm_model", "gpt-5.4-mini")
             prompt = (
                 "Summarize this conversation in 2 sentences max. "
                 "Then list any unresolved threads or follow-up items as a bullet list (max 5). "
@@ -253,12 +254,34 @@ class EngramMemoryProvider(_MemoryProvider):
                 f"CONVERSATION:\n{conversation}"
             )
 
-            msg = client.messages.create(
-                model=self._cfg.get("llm_model", "claude-haiku-4-5"),
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = msg.content[0].text.strip()
+            if provider == "anthropic":
+                import anthropic
+                client = anthropic.Anthropic(api_key=api_key)
+                msg = client.messages.create(
+                    model=model,
+                    max_tokens=500,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = msg.content[0].text.strip()
+            else:
+                # OpenAI-compatible (uses whatever base_url the Hermes provider exposes)
+                base_url = getattr(self, "_api_base_url", None) or "https://api.openai.com/v1"
+                resp = requests.post(
+                    f"{base_url.rstrip('/')}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "max_tokens": 500,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             data = json.loads(raw)
@@ -303,9 +326,75 @@ class EngramMemoryProvider(_MemoryProvider):
             logger.debug("Engram: briefing regen failed: %s", e)
 
     def _get_api_key(self) -> Optional[str]:
+        """Resolve an API key and base URL for session summarization.
+
+        Priority:
+        1. ANTHROPIC_API_KEY env var (for Anthropic provider)
+        2. Hermes credential pool (reads active provider from config.yaml)
+        3. Codex OAuth access token from ~/.codex/auth.json
+        4. .env file fallback
+
+        Sets self._api_base_url for the resolved provider.
+        """
+        provider = self._cfg.get("llm_provider", "hermes")
+        self._api_base_url = None
+
+        # Read active provider from Hermes config
+        hermes_cfg_path = Path("~/.hermes/config.yaml").expanduser()
+        hermes_provider = None
+        hermes_base_url = None
+        if hermes_cfg_path.exists():
+            try:
+                import yaml
+                cfg = yaml.safe_load(hermes_cfg_path.read_text()) or {}
+                hermes_provider = cfg.get("model", {}).get("provider", "")
+                hermes_base_url = cfg.get("model", {}).get("base_url", "")
+            except Exception:
+                pass
+
+        if provider != "anthropic":
+            # Try Hermes credential pool — match active provider first
+            auth_path = Path("~/.hermes/auth.json").expanduser()
+            if auth_path.exists():
+                try:
+                    data = json.loads(auth_path.read_text())
+                    pool = data.get("credential_pool", {})
+                    # Try the active Hermes provider first
+                    if hermes_provider and hermes_provider in pool:
+                        for creds in pool[hermes_provider]:
+                            token = creds.get("access_token", "")
+                            if token and len(token) > 10:
+                                self._api_base_url = creds.get("base_url") or hermes_base_url
+                                return token
+                    # Fallback: scan all providers
+                    for prov_name, creds_list in pool.items():
+                        if prov_name == "anthropic":
+                            continue
+                        for creds in creds_list:
+                            token = creds.get("access_token", "")
+                            if token and len(token) > 10:
+                                self._api_base_url = creds.get("base_url") or hermes_base_url
+                                return token
+                except Exception:
+                    pass
+
+            # Codex OAuth token
+            codex_path = Path("~/.codex/auth.json").expanduser()
+            if codex_path.exists():
+                try:
+                    data = json.loads(codex_path.read_text())
+                    token = data.get("accessToken", "")
+                    if token and len(token) > 10:
+                        return token
+                except Exception:
+                    pass
+
+        # Anthropic env var
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         if key and key != "***":
             return key
+
+        # .env file
         env_path = Path("~/.hermes/.env").expanduser()
         if env_path.exists():
             for line in env_path.read_text().splitlines():
