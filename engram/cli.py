@@ -21,7 +21,13 @@ import click
 from . import __version__
 from .schema import init_db, get_meta
 from .indexer import full_index, start_watcher
-from .query import full_text_search, get_standing_rules
+from .query import (
+    full_text_search,
+    get_standing_rules,
+    get_sessions,
+    get_top_entities,
+    get_recent_facts,
+)
 from .briefing import generate_briefing
 
 DEFAULT_CONFIG = Path("~/.engram/config.json").expanduser()
@@ -68,6 +74,107 @@ def _check_index(cfg: dict) -> str:
     if not Path(db_path).exists():
         click.echo("Index not built yet. Run 'engram index' first.", err=True)
     return db_path
+
+
+def _collect_dream_report(cfg: dict, dry_run: bool = False, days: int = 7, limit: int = 5) -> dict:
+    vault = _check_vault(cfg)
+    db_path = str(Path(cfg["index_db"]).expanduser())
+    conn = init_db(db_path)
+
+    vault_notes = sorted(
+        [p for p in vault.rglob("*.md") if p.is_file() and not p.name.startswith(".")]
+    )
+    daily_dir = vault / "Daily"
+    recent_daily = []
+    if daily_dir.exists():
+        recent_daily = sorted(
+            [p for p in daily_dir.glob("*.md") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:limit]
+
+    index_before = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    index_stats = {
+        "new": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    if not dry_run:
+        index_stats = full_index(conn, str(vault))
+
+    index_after = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    standing_rules = get_standing_rules(conn)[:limit]
+    sessions = get_sessions(conn, limit=limit)
+    top_entities = get_top_entities(conn, limit=limit)
+    recent_facts = get_recent_facts(conn, days=days, limit=limit)
+    last_indexed = get_meta(conn, "last_indexed", "never")
+
+    return {
+        "success": True,
+        "dry_run": dry_run,
+        "vault_path": str(vault),
+        "index_db": db_path,
+        "vault_notes": len(vault_notes),
+        "recent_daily_notes": [str(p.relative_to(vault)) for p in recent_daily],
+        "index_before": index_before,
+        "index_after": index_after,
+        "index_stats": index_stats,
+        "last_indexed": last_indexed,
+        "standing_rules": standing_rules,
+        "top_entities": top_entities,
+        "recent_facts": recent_facts,
+        "sessions": sessions,
+        "days": days,
+        "limit": limit,
+    }
+
+
+def _render_dream_report(report: dict) -> None:
+    mode = "dry-run" if report.get("dry_run") else "live"
+    click.echo(f"☾ Engram dream ({mode})")
+    click.echo(f"Vault:        {report['vault_path']}")
+    click.echo(f"Index DB:     {report['index_db']}")
+    click.echo(f"Vault notes:  {report['vault_notes']}")
+    click.echo(f"Index docs:   {report['index_after']}")
+    click.echo(f"Last indexed: {report['last_indexed']}")
+
+    stats = report.get("index_stats", {})
+    if report.get("dry_run"):
+        click.echo("Index pass:   skipped (dry-run)")
+    else:
+        click.echo(
+            "Index pass:   "
+            f"new={stats.get('new', 0)} "
+            f"updated={stats.get('updated', 0)} "
+            f"skipped={stats.get('skipped', 0)} "
+            f"errors={stats.get('errors', 0)}"
+        )
+
+    if report.get("recent_daily_notes"):
+        click.echo("\nRecent Daily notes:")
+        for path in report["recent_daily_notes"]:
+            click.echo(f"  - {path}")
+
+    if report.get("standing_rules"):
+        click.echo("\nStanding rules:")
+        for item in report["standing_rules"]:
+            click.echo(f"  - {item['title']}")
+
+    if report.get("top_entities"):
+        click.echo("\nTop entities:")
+        for item in report["top_entities"]:
+            click.echo(f"  - {item['title']}")
+
+    if report.get("recent_facts"):
+        click.echo(f"\nRecent facts ({report['days']}d):")
+        for item in report["recent_facts"]:
+            click.echo(f"  - {item['title']}")
+
+    if report.get("sessions"):
+        click.echo("\nRecent sessions:")
+        for item in report["sessions"]:
+            click.echo(f"  - {item['title']}")
 
 
 def setup_logging(level: str, log_path: str = None):
@@ -309,6 +416,147 @@ def ingest(ctx, sources):
     conn = init_db(db_path)
     full_index(conn, vault)
     click.echo("Index updated.")
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Inspect without updating the index")
+@click.option("--json", "json_output", is_flag=True, help="Print the dream report as JSON")
+@click.option("--days", default=7, show_default=True, help="Recent-fact lookback window")
+@click.option("--limit", default=5, show_default=True, help="Max items per section")
+@click.pass_context
+def dream(ctx, dry_run, json_output, days, limit):
+    """Run a quiet maintenance pass over the vault and index."""
+    cfg = ctx.obj["cfg"]
+    report = _collect_dream_report(cfg, dry_run=dry_run, days=days, limit=limit)
+    if json_output:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        _render_dream_report(report)
+
+
+@cli.command()
+@click.option("--days", default=1, show_default=True, help="Days of raw sessions to synthesize")
+@click.option("--json", "json_output", is_flag=True, help="Print results as JSON")
+@click.option("--api-key", default=None, help="API key for synthesis LLM")
+@click.pass_context
+def synthesize(ctx, days, json_output, api_key):
+    """Run dialectical synthesis — extract new facts/entities from raw sessions."""
+    from .dialectical import synthesize_sessions, apply_synthesis
+    import requests as http_requests
+
+    cfg = ctx.obj["cfg"]
+    vault = str(_check_vault(cfg))
+    db_path = str(Path(cfg["index_db"]).expanduser())
+
+    # Resolve API key from: --api-key flag > ANTHROPIC_API_KEY env > Hermes credential pool
+    resolved_key = api_key
+    provider = cfg.get("llm_provider", "hermes")
+    base_url = cfg.get("llm_base_url", "")
+    model = cfg.get("llm_model", "claude-haiku-4-5")
+
+    if not resolved_key:
+        # Try env
+        resolved_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not resolved_key:
+            env_path = Path("~/.hermes/.env").expanduser()
+            if env_path.exists():
+                for line in env_path.read_text().splitlines():
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    if k == "ANTHROPIC_API_KEY" and v and v != "***":
+                        resolved_key = v
+                        break
+
+    if not resolved_key:
+        # Try Hermes credential pool
+        auth_path = Path("~/.hermes/auth.json").expanduser()
+        if auth_path.exists():
+            try:
+                auth = json.loads(auth_path.read_text())
+                pool = auth.get("credential_pool", {})
+                for prov_name, creds_list in pool.items():
+                    for c in creds_list:
+                        t = c.get("access_token", "")
+                        bu = c.get("base_url", "")
+                        if t and len(t) > 10:
+                            resolved_key = t
+                            if bu:
+                                base_url = bu
+                            break
+                    if resolved_key:
+                        break
+            except Exception:
+                pass
+
+    if not resolved_key:
+        click.echo("Error: No API key found. Set ANTHROPIC_API_KEY, configure auth.json, or pass --api-key", err=True)
+        raise SystemExit(1)
+
+    def llm_call(prompt: str) -> str:
+        if provider == "anthropic" and not base_url:
+            import anthropic
+            client = anthropic.Anthropic(api_key=resolved_key)
+            msg = client.messages.create(
+                model=model,
+                max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return msg.content[0].text.strip()
+
+        # OpenAI-compatible (handles reasoning models)
+        url = (base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+        resp = http_requests.post(
+            url,
+            headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
+            json={"model": model, "max_tokens": 8000, "messages": [{"role": "user", "content": prompt}]},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        content = msg.get("content", "") or ""
+        if content.strip():
+            return content.strip()
+        # Reasoning models: extract from reasoning_content
+        reasoning = msg.get("reasoning_content", "") or ""
+        if reasoning.strip():
+            for line in reversed(reasoning.strip().split("\n")):
+                cleaned = line.strip().lstrip("*0123456789. ")
+                if len(cleaned) > 30 and not cleaned.lower().startswith(("analyze", "draft", "step", "note")):
+                    return cleaned
+        return ""
+
+    click.echo(f"Synthesizing last {days} day(s) of sessions...")
+
+    # Synthesize
+    result = synthesize_sessions(vault, llm_call, days=days)
+
+    # Apply
+    apply_stats = apply_synthesis(vault, result)
+
+    # Re-index
+    conn = init_db(db_path)
+    full_index(conn, vault)
+
+    combined = {**result, **apply_stats}
+
+    if json_output:
+        for key in list(combined.keys()):
+            if not isinstance(combined[key], (str, int, float, bool, list, dict, type(None))):
+                combined.pop(key)
+        click.echo(json.dumps(combined, indent=2, default=str))
+    else:
+        click.echo(f"\n☾ Synthesis complete")
+        click.echo(f"  Sessions scanned:  {result.get('sessions_scanned', 0)}")
+        click.echo(f"  New facts:         {apply_stats.get('facts_created', 0)}")
+        click.echo(f"  New entities:      {apply_stats.get('entities_created', 0)}")
+        click.echo(f"  Facts updated:     {apply_stats.get('facts_updated', 0)}")
+        click.echo(f"  Errors:            {apply_stats.get('errors', 0)}")
+        if result.get("synthesis"):
+            click.echo(f"\n  Summary: {result['synthesis']}")
 
 
 @cli.command()

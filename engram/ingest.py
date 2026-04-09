@@ -5,6 +5,7 @@ writes Entity and Fact notes back to the vault.
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, date
 from pathlib import Path
@@ -288,7 +289,6 @@ def run_ingest(
     }
 
     if not api_key:
-        import os
         api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         # Try loading from ~/.hermes/.env directly

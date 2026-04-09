@@ -26,8 +26,8 @@ from .query import (
 
 logger = logging.getLogger("engram.briefing")
 
-# Hard budget in characters. ~200 tokens at avg 4 chars/token.
-DEFAULT_BUDGET = 800
+# Hard budget in characters. ~500 tokens at avg 4 chars/token.
+DEFAULT_BUDGET = 2000
 
 # Keywords that indicate a fact is already covered in SOUL.md / system prompt.
 # If a fact's content matches enough of these, skip it.
@@ -105,6 +105,7 @@ def generate_briefing(
     budget: int = DEFAULT_BUDGET,
     platform: Optional[str] = None,
     soul_path: Optional[str] = None,
+    first_message: str = "",
 ) -> str:
     """
     Generate a lean session briefing within a hard char budget.
@@ -113,8 +114,9 @@ def generate_briefing(
       1. Standing rules (skip SOUL.md dupes, skip platform-irrelevant)
       2. Open loops (max 2)
       3. Last session open_threads only (not full summary)
-      4. Key entities (names only, no descriptions)
-      5. Recent facts (titles only, no excerpts)
+      4. Cross-session continuity thread (recent related sessions)
+      5. Key entities (names only, no descriptions)
+      6. Recent facts (titles only, no excerpts)
     """
     soul_text = _load_soul_text(soul_path)
     soul_words = set(re.findall(r"\w+", soul_text.lower()))
@@ -185,24 +187,44 @@ def generate_briefing(
     sessions = get_sessions(conn, limit=1)
     if sessions:
         s = sessions[0]
-        body = _read_note_body(vault_root, s["path"])
-        # Extract open_threads from frontmatter
+        # Load frontmatter once, use for both body and metadata
         try:
-            post = fm.load(str(Path(vault_root).expanduser() / s["path"]))
-            threads = post.metadata.get("open_threads", [])
-            if threads:
-                thread_lines = "\n".join(f"  - {t}" for t in threads[:3])
-                block = f"## Last session threads\n{thread_lines}\n"
-                if len(block) <= remaining:
-                    sections.append(block)
-                    remaining -= len(block)
+            import frontmatter as fm_local
+            session_path = Path(vault_root).expanduser() / s["path"]
+            if session_path.exists():
+                post = fm_local.load(str(session_path))
+                threads = post.metadata.get("open_threads", [])
+                if threads:
+                    thread_lines = "\n".join(f"  - {t}" for t in threads[:3])
+                    block = f"## Last session threads\n{thread_lines}\n"
+                    if len(block) <= remaining:
+                        sections.append(block)
+                        remaining -= len(block)
         except Exception:
             pass
 
     if remaining <= 50:
         return "\n".join(sections).strip()
 
-    # --- 4. Key entities (names only) ---
+    # --- 4. Cross-session continuity ---
+    try:
+        from .continuity import build_continuity_thread
+        continuity = build_continuity_thread(
+            conn, vault_root,
+            current_topic=None,
+            days=7, max_sessions=3,
+            budget=min(remaining, 400),
+        )
+        if continuity and len(continuity) <= remaining:
+            sections.append(continuity)
+            remaining -= len(continuity)
+    except Exception as e:
+        logger.debug("Continuity thread failed (non-fatal): %s", e)
+
+    if remaining <= 50:
+        return "\n".join(sections).strip()
+
+    # --- 5. Key entities (names only) ---
     entities = get_top_entities(conn, limit=max_entities)
     if entities:
         names = ", ".join(e["title"] for e in entities)
@@ -211,16 +233,18 @@ def generate_briefing(
             sections.append(block)
             remaining -= len(block)
         else:
-            # Truncate entity list to fit
-            truncated = _truncate(names, remaining - 12)
-            block = f"## Entities\n{truncated}\n"
-            sections.append(block)
-            remaining -= len(block)
+            # Truncate entity list to fit, never exceed budget
+            max_name_len = max(0, remaining - 12)  # "## Entities\n" + "\n" = 12
+            if max_name_len > 10:
+                truncated = _truncate(names, max_name_len)
+                block = f"## Entities\n{truncated}\n"
+                sections.append(block)
+                remaining -= len(block)
 
     if remaining <= 50:
         return "\n".join(sections).strip()
 
-    # --- 5. Recent facts (titles only, skip SOUL-covered) ---
+    # --- 6. Recent facts (titles only, skip SOUL-covered) ---
     facts = get_recent_facts(conn, days=7, limit=max_facts)
     def _clean_slug(t):
         t = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", t)

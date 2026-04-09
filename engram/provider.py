@@ -49,7 +49,8 @@ ENGRAM_RECALL_SCHEMA = {
         "- Checking for existing constraints before making a recommendation\n"
         "- TheDev says 'do you remember' or 'last time we'\n"
         "- You want to verify standing rules or preferences\n\n"
-        "Returns compact results (title + key fact, max 5). Low token cost."
+        "Returns compact results (title + key fact, max 5). Low token cost.\n\n"
+        "When synthesize=true, an LLM synthesizes a coherent answer from the search results."
     ),
     "parameters": {
         "type": "object",
@@ -62,6 +63,10 @@ ENGRAM_RECALL_SCHEMA = {
                 "type": "string",
                 "enum": ["all", "fact", "entity", "session"],
                 "description": "Filter by note type. Default: all",
+            },
+            "synthesize": {
+                "type": "boolean",
+                "description": "If true, LLM synthesizes a coherent answer from search results. Higher token cost but better for complex queries.",
             },
         },
         "required": ["query"],
@@ -109,7 +114,7 @@ class EngramMemoryProvider(_MemoryProvider):
         defaults = {
             "vault_path": "~/obsidian-vault",
             "index_db": "~/.engram/vault_index.db",
-            "briefing_budget": 800,
+            "briefing_budget": 2000,
             "briefing_max_facts": 10,
             "briefing_max_entities": 8,
             "ingest_sources": ["Daily", "Projects"],
@@ -177,14 +182,35 @@ class EngramMemoryProvider(_MemoryProvider):
 
         query = args.get("query", "").strip()
         type_filter = args.get("type", "all")
+        do_synthesize = args.get("synthesize", False)
         if not query:
             return json.dumps({"error": "query is required"})
 
         try:
+            # If synthesis requested, use the enhanced recall module
+            if do_synthesize:
+                llm_fn = self._make_llm_callable()
+                if llm_fn:
+                    from engram.recall import recall as recall_fn
+                    with self._lock:
+                        result = recall_fn(
+                            self._conn,
+                            self._vault_root,
+                            query,
+                            llm_call_fn=llm_fn,
+                            type_filter=type_filter if type_filter != "all" else None,
+                            limit=5,
+                            synthesize=True,
+                        )
+                    return json.dumps(result)
+                # Fall through to plain search if no LLM callable
+
+            # Plain FTS5 search (default path)
             types = None if type_filter == "all" else [type_filter]
-            results = self._mods["full_text_search"](
-                self._conn, query, types=types, limit=5
-            )
+            with self._lock:
+                results = self._mods["full_text_search"](
+                    self._conn, query, types=types, limit=5
+                )
             if not results:
                 return json.dumps({"results": [], "message": "No matches found."})
 
@@ -212,6 +238,58 @@ class EngramMemoryProvider(_MemoryProvider):
             logger.warning("engram_recall failed: %s", e)
             return json.dumps({"error": str(e)})
 
+    def _make_llm_callable(self):
+        """Build an LLM callable for synthesis, reusing session-save credentials."""
+        api_key = self._get_api_key()
+        if not api_key:
+            return None
+
+        provider = self._cfg.get("llm_provider", "hermes")
+        model = self._cfg.get("llm_model", "gpt-5.4-mini")
+        base_url = getattr(self, "_api_base_url", None)
+
+        def llm_call(prompt: str) -> str:
+            if provider == "anthropic" and base_url is None:
+                import anthropic
+                client = anthropic.Anthropic(api_key=api_key)
+                msg = client.messages.create(
+                    model=model,
+                    max_tokens=2000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return msg.content[0].text.strip()
+
+            # OpenAI-compatible (handles reasoning models)
+            import requests
+            url = (base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "max_tokens": 8000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            content = msg.get("content", "") or ""
+            if content.strip():
+                return content.strip()
+            # Reasoning models may put output in reasoning_content
+            reasoning = msg.get("reasoning_content", "") or ""
+            if reasoning.strip():
+                # Extract final synthesis from reasoning — skip analysis steps
+                for line in reversed(reasoning.strip().split("\n")):
+                    cleaned = line.strip().lstrip("*0123456789. ")
+                    if len(cleaned) > 30 and not cleaned.lower().startswith(("analyze", "draft", "step", "note")):
+                        return cleaned
+            return ""
+
+        return llm_call
+
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         if not self._mods or self._agent_context != "primary":
             return
@@ -228,6 +306,18 @@ class EngramMemoryProvider(_MemoryProvider):
         try:
             import re, requests
 
+            # Archive raw conversation for dialectical synthesis
+            try:
+                from engram.dialectical import archive_raw_session
+                archive_raw_session(
+                    vault_root=self._vault_root,
+                    session_id=self._session_id,
+                    messages=messages,
+                    platform=self._platform,
+                )
+            except Exception as e:
+                logger.debug("Raw session archive failed (non-fatal): %s", e)
+
             turns = []
             for m in messages:
                 role = m.get("role", "")
@@ -243,7 +333,7 @@ class EngramMemoryProvider(_MemoryProvider):
                 return
 
             conversation = "\n\n".join(turns[-20:])
-            provider = self._cfg.get("llm_provider", "openai")
+            provider = self._cfg.get("llm_provider", "hermes")
             model = self._cfg.get("llm_model", "gpt-5.4-mini")
             prompt = (
                 "Summarize this conversation in 2 sentences max. "
@@ -294,9 +384,11 @@ class EngramMemoryProvider(_MemoryProvider):
                 platform=self._platform,
             )
 
-            if self._conn:
-                with self._lock:
-                    self._mods["full_index"](self._conn, self._vault_root)
+            if self._db_path and self._mods:
+                # Use a separate connection in the background thread (SQLite is not thread-safe)
+                bg_conn = self._mods["init_db"](self._db_path)
+                self._mods["full_index"](bg_conn, self._vault_root)
+                bg_conn.close()
 
             self._regenerate_briefing()
             logger.info("Engram: session saved (%d threads, %d entities)",
@@ -306,15 +398,17 @@ class EngramMemoryProvider(_MemoryProvider):
 
     def _regenerate_briefing(self) -> None:
         try:
-            if not self._conn or not self._mods:
+            if not self._db_path or not self._mods:
                 return
+            bg_conn = self._mods["init_db"](self._db_path)
             briefing_md = self._mods["generate_briefing"](
-                self._conn, self._vault_root,
+                bg_conn, self._vault_root,
                 max_facts=self._cfg.get("briefing_max_facts", 10),
                 max_entities=self._cfg.get("briefing_max_entities", 8),
-                budget=self._cfg.get("briefing_budget", 800),
+                budget=self._cfg.get("briefing_budget", 2000),
                 platform=self._platform,
             )
+            bg_conn.close()
             prefill = [
                 {"role": "user", "content": briefing_md},
                 {"role": "assistant", "content": "Memory loaded."},
