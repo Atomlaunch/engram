@@ -11,11 +11,17 @@ dependencies = [
     "watchdog>=4.0",
     "python-frontmatter>=1.1",
     "click>=8.1",
+    "anthropic>=0.40",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
-all = ["engram[anthropic]"]
+# anthropic and requests are core (NUBIS-002): the default ingest path imports
+# anthropic and the OpenAI-compatible path imports requests. Extras stay as
+# no-op aliases so existing `engram[anthropic]` installs keep working.
+anthropic = []
+all = []
+test = ["pytest>=8"]
 
 [project.scripts]
 engram = "engram.cli:cli"

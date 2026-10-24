@@ -87,6 +87,49 @@ def _chunk_file(path: str, max_chars: int = 6000) -> list:
     return chunks or [content[:max_chars]]
 
 
+def _extract_json_text(text: str) -> str:
+    """Return the complete JSON object inside model output (NUBIS-001).
+
+    Reasoning-only completions often wrap a formatted, multi-line JSON answer in
+    prose or a ```json fence. Try, in order: the whole text, the last fenced
+    block, then the widest balanced {...} span that parses. Non-JSON text is
+    returned unchanged so the caller's json.loads still fails safely.
+    """
+    candidates = [text.strip()]
+    candidates += [m.strip() for m in reversed(re.findall(r"```(?:json)?\s*(.*?)```", text, re.S))]
+    starts = [i for i, ch in enumerate(text) if ch == "{"]
+    for start in starts:
+        depth, in_str, esc = 0, False, False
+        for j in range(start, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start:j + 1])
+                    break
+    best = None
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and (best is None or len(cand) > len(best)):
+            best = cand
+    return best if best is not None else text.strip()
+
+
 def _call_llm(chunk: str, model: str, api_key: str, existing_titles: list = None,
               base_url: str = None) -> Optional[dict]:
     """Call LLM API for extraction. Supports Anthropic and OpenAI-compatible endpoints.
@@ -121,11 +164,7 @@ def _call_llm(chunk: str, model: str, api_key: str, existing_titles: list = None
                 # Reasoning models may put output in reasoning_content
                 reasoning = msg.get("reasoning_content", "") or ""
                 if reasoning.strip():
-                    for line in reversed(reasoning.strip().split("\n")):
-                        cleaned = line.strip().lstrip("*0123456789. ")
-                        if len(cleaned) > 30:
-                            raw = cleaned
-                            break
+                    raw = _extract_json_text(reasoning)
         else:
             # Anthropic native
             import anthropic
