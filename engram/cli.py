@@ -397,7 +397,9 @@ def ingest(ctx, sources):
     db_path = str(Path(cfg["index_db"]).expanduser())
 
     source_dirs = sources.split(",") if sources else cfg.get("ingest_sources", ["Daily"])
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    provider = cfg.get("llm_provider") or "anthropic"
+    base_url = cfg.get("llm_base_url") or None
+    api_key = os.environ.get("ANTHROPIC_API_KEY") if provider == "anthropic" else None
 
     click.echo(f"Running ingest from: {source_dirs}")
     stats = run_ingest(
@@ -405,6 +407,8 @@ def ingest(ctx, sources):
         source_dirs=source_dirs,
         model=cfg.get("llm_model", "claude-haiku-4-5"),
         api_key=api_key,
+        provider=provider,
+        base_url=base_url,
     )
     click.echo(
         f"Ingest complete. files={stats['files_processed']} "

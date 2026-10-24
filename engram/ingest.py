@@ -362,23 +362,27 @@ def run_ingest(
         "errors": 0,
     }
 
-    # Load provider/model from engram config if not specified
+    # Fill provider/model/endpoint from the Engram config. Explicit arguments win (NUBIS-003).
+    cfg = {}
+    cfg_path = Path("~/.engram/config.json").expanduser()
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            cfg = {}
     if not provider:
-        cfg_path = Path("~/.engram/config.json").expanduser()
-        if cfg_path.exists():
-            try:
-                cfg = json.loads(cfg_path.read_text())
-                provider = cfg.get("llm_provider", "anthropic")
-                if model == "claude-haiku-4-5" and cfg.get("llm_model"):
-                    model = cfg["llm_model"]
-            except Exception:
-                pass
-        if not provider:
-            provider = "anthropic"
+        provider = cfg.get("llm_provider") or "anthropic"
+    if model == "claude-haiku-4-5" and cfg.get("llm_model"):
+        model = cfg["llm_model"]
+    if not base_url and provider != "anthropic":
+        base_url = cfg.get("llm_base_url") or None
+    explicit_endpoint = bool(base_url)
+    if not api_key and provider != "anthropic":
+        api_key = os.environ.get(cfg.get("llm_api_key_env") or "OPENAI_API_KEY") or None
 
-    if not api_key:
+    if not api_key and provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    if not api_key and provider == "anthropic":
         # Try loading from ~/.hermes/.env directly
         # Check multiple key names in priority order
         env_path = Path("~/.hermes/.env").expanduser()
@@ -403,7 +407,8 @@ def run_ingest(
                     break
 
     # Resolve base_url for OpenAI-compatible providers (also provides api_key from credential pool)
-    if provider != "anthropic" and not (api_key and base_url):
+    # A configured/caller endpoint is never replaced by a credential-pool endpoint.
+    if provider != "anthropic" and not explicit_endpoint and not (api_key and base_url):
         # Only check credential pool if credentials weren't fully provided
         auth_path = Path("~/.hermes/auth.json").expanduser()
         if auth_path.exists():
