@@ -87,23 +87,95 @@ def _chunk_file(path: str, max_chars: int = 6000) -> list:
     return chunks or [content[:max_chars]]
 
 
-def _call_llm(chunk: str, model: str, api_key: str, existing_titles: list = None) -> Optional[dict]:
-    """Call Anthropic API for extraction. Returns parsed JSON or None."""
+def _extract_json_text(text: str) -> str:
+    """Return the complete JSON object inside model output (NUBIS-001).
+
+    Reasoning-only completions often wrap a formatted, multi-line JSON answer in
+    prose or a ```json fence. Try, in order: the whole text, the last fenced
+    block, then the widest balanced {...} span that parses. Non-JSON text is
+    returned unchanged so the caller's json.loads still fails safely.
+    """
+    candidates = [text.strip()]
+    candidates += [m.strip() for m in reversed(re.findall(r"```(?:json)?\s*(.*?)```", text, re.S))]
+    starts = [i for i, ch in enumerate(text) if ch == "{"]
+    for start in starts:
+        depth, in_str, esc = 0, False, False
+        for j in range(start, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start:j + 1])
+                    break
+    best = None
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and (best is None or len(cand) > len(best)):
+            best = cand
+    return best if best is not None else text.strip()
+
+
+def _call_llm(chunk: str, model: str, api_key: str, existing_titles: list = None,
+              base_url: str = None) -> Optional[dict]:
+    """Call LLM API for extraction. Supports Anthropic and OpenAI-compatible endpoints.
+    Returns parsed JSON or None."""
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
         # Inject existing titles so LLM avoids extracting duplicates
         existing_block = ""
         if existing_titles:
             titles_list = "\n".join(f"- {t}" for t in existing_titles[:50])
             existing_block = f"\nALREADY STORED (do NOT re-extract these or close variants):\n{titles_list}\n"
         prompt = EXTRACTION_PROMPT.replace("{document}", existing_block + "\n" + chunk)
-        msg = client.messages.create(
-            model=model,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = msg.content[0].text.strip()
+
+        if base_url:
+            # OpenAI-compatible endpoint
+            import requests
+            url = base_url.rstrip("/") + "/chat/completions"
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            raw = msg.get("content", "") or ""
+            if not raw.strip():
+                # Reasoning models may put output in reasoning_content
+                reasoning = msg.get("reasoning_content", "") or ""
+                if reasoning.strip():
+                    raw = _extract_json_text(reasoning)
+        else:
+            # Anthropic native
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model=model,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text.strip()
+
         # Strip markdown fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -273,6 +345,8 @@ def run_ingest(
     source_dirs: list,
     model: str = "claude-haiku-4-5",
     api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
     max_workers: int = 5,
 ) -> dict:
     """
@@ -288,9 +362,27 @@ def run_ingest(
         "errors": 0,
     }
 
-    if not api_key:
+    # Fill provider/model/endpoint from the Engram config. Explicit arguments win (NUBIS-003).
+    cfg = {}
+    cfg_path = Path("~/.engram/config.json").expanduser()
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            cfg = {}
+    if not provider:
+        provider = cfg.get("llm_provider") or "anthropic"
+    if model == "claude-haiku-4-5" and cfg.get("llm_model"):
+        model = cfg["llm_model"]
+    if not base_url and provider != "anthropic":
+        base_url = cfg.get("llm_base_url") or None
+    explicit_endpoint = bool(base_url)
+    if not api_key and provider != "anthropic":
+        api_key = os.environ.get(cfg.get("llm_api_key_env") or "OPENAI_API_KEY") or None
+
+    if not api_key and provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    if not api_key and provider == "anthropic":
         # Try loading from ~/.hermes/.env directly
         # Check multiple key names in priority order
         env_path = Path("~/.hermes/.env").expanduser()
@@ -313,6 +405,46 @@ def run_ingest(
                 if name in candidates:
                     api_key = candidates[name]
                     break
+
+    # Resolve base_url for OpenAI-compatible providers (also provides api_key from credential pool)
+    # A configured/caller endpoint is never replaced by a credential-pool endpoint.
+    if provider != "anthropic" and not explicit_endpoint and not (api_key and base_url):
+        # Only check credential pool if credentials weren't fully provided
+        auth_path = Path("~/.hermes/auth.json").expanduser()
+        if auth_path.exists():
+            try:
+                auth_data = json.loads(auth_path.read_text())
+                pool = auth_data.get("credential_pool", {})
+                hermes_cfg_path = Path("~/.hermes/config.yaml").expanduser()
+                hermes_provider = None
+                hermes_base_url = None
+                if hermes_cfg_path.exists():
+                    import yaml
+                    hcfg = yaml.safe_load(hermes_cfg_path.read_text()) or {}
+                    hermes_provider = hcfg.get("model", {}).get("provider", "")
+                    hermes_base_url = hcfg.get("model", {}).get("base_url", "")
+                if hermes_provider and hermes_provider in pool:
+                    for creds in pool[hermes_provider]:
+                        token = creds.get("access_token", "")
+                        if token and len(token) > 10:
+                            base_url = creds.get("base_url") or hermes_base_url
+                            api_key = token
+                            break
+                if not base_url:
+                    for prov_name, creds_list in pool.items():
+                        if prov_name == "anthropic":
+                            continue
+                        for creds in creds_list:
+                            token = creds.get("access_token", "")
+                            if token and len(token) > 10:
+                                base_url = creds.get("base_url") or hermes_base_url
+                                api_key = token
+                                break
+                        if base_url:
+                            break
+            except Exception as e:
+                logger.warning(f"Failed to read Hermes auth.json: {e}")
+
     if not api_key:
         raise ValueError("No API key -- set ANTHROPIC_API_KEY or pass api_key")
 
@@ -387,7 +519,7 @@ def run_ingest(
 
     # Parallel LLM extraction
     def process_chunk(chunk):
-        return _call_llm(chunk, model, api_key, existing_titles=existing_titles_list)
+        return _call_llm(chunk, model, api_key, existing_titles=existing_titles_list, base_url=base_url)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_chunk, c): c for c in chunks}
