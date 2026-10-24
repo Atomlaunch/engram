@@ -87,23 +87,56 @@ def _chunk_file(path: str, max_chars: int = 6000) -> list:
     return chunks or [content[:max_chars]]
 
 
-def _call_llm(chunk: str, model: str, api_key: str, existing_titles: list = None) -> Optional[dict]:
-    """Call Anthropic API for extraction. Returns parsed JSON or None."""
+def _call_llm(chunk: str, model: str, api_key: str, existing_titles: list = None,
+              base_url: str = None) -> Optional[dict]:
+    """Call LLM API for extraction. Supports Anthropic and OpenAI-compatible endpoints.
+    Returns parsed JSON or None."""
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
         # Inject existing titles so LLM avoids extracting duplicates
         existing_block = ""
         if existing_titles:
             titles_list = "\n".join(f"- {t}" for t in existing_titles[:50])
             existing_block = f"\nALREADY STORED (do NOT re-extract these or close variants):\n{titles_list}\n"
         prompt = EXTRACTION_PROMPT.replace("{document}", existing_block + "\n" + chunk)
-        msg = client.messages.create(
-            model=model,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = msg.content[0].text.strip()
+
+        if base_url:
+            # OpenAI-compatible endpoint
+            import requests
+            url = base_url.rstrip("/") + "/chat/completions"
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"]
+            raw = msg.get("content", "") or ""
+            if not raw.strip():
+                # Reasoning models may put output in reasoning_content
+                reasoning = msg.get("reasoning_content", "") or ""
+                if reasoning.strip():
+                    for line in reversed(reasoning.strip().split("\n")):
+                        cleaned = line.strip().lstrip("*0123456789. ")
+                        if len(cleaned) > 30:
+                            raw = cleaned
+                            break
+        else:
+            # Anthropic native
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model=model,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text.strip()
+
         # Strip markdown fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -273,6 +306,8 @@ def run_ingest(
     source_dirs: list,
     model: str = "claude-haiku-4-5",
     api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
     max_workers: int = 5,
 ) -> dict:
     """
@@ -287,6 +322,20 @@ def run_ingest(
         "facts_created": 0,
         "errors": 0,
     }
+
+    # Load provider/model from engram config if not specified
+    if not provider:
+        cfg_path = Path("~/.engram/config.json").expanduser()
+        if cfg_path.exists():
+            try:
+                cfg = json.loads(cfg_path.read_text())
+                provider = cfg.get("llm_provider", "anthropic")
+                if model == "claude-haiku-4-5" and cfg.get("llm_model"):
+                    model = cfg["llm_model"]
+            except Exception:
+                pass
+        if not provider:
+            provider = "anthropic"
 
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -313,6 +362,45 @@ def run_ingest(
                 if name in candidates:
                     api_key = candidates[name]
                     break
+
+    # Resolve base_url for OpenAI-compatible providers (also provides api_key from credential pool)
+    if provider != "anthropic" and not (api_key and base_url):
+        # Only check credential pool if credentials weren't fully provided
+        auth_path = Path("~/.hermes/auth.json").expanduser()
+        if auth_path.exists():
+            try:
+                auth_data = json.loads(auth_path.read_text())
+                pool = auth_data.get("credential_pool", {})
+                hermes_cfg_path = Path("~/.hermes/config.yaml").expanduser()
+                hermes_provider = None
+                hermes_base_url = None
+                if hermes_cfg_path.exists():
+                    import yaml
+                    hcfg = yaml.safe_load(hermes_cfg_path.read_text()) or {}
+                    hermes_provider = hcfg.get("model", {}).get("provider", "")
+                    hermes_base_url = hcfg.get("model", {}).get("base_url", "")
+                if hermes_provider and hermes_provider in pool:
+                    for creds in pool[hermes_provider]:
+                        token = creds.get("access_token", "")
+                        if token and len(token) > 10:
+                            base_url = creds.get("base_url") or hermes_base_url
+                            api_key = token
+                            break
+                if not base_url:
+                    for prov_name, creds_list in pool.items():
+                        if prov_name == "anthropic":
+                            continue
+                        for creds in creds_list:
+                            token = creds.get("access_token", "")
+                            if token and len(token) > 10:
+                                base_url = creds.get("base_url") or hermes_base_url
+                                api_key = token
+                                break
+                        if base_url:
+                            break
+            except Exception as e:
+                logger.warning(f"Failed to read Hermes auth.json: {e}")
+
     if not api_key:
         raise ValueError("No API key -- set ANTHROPIC_API_KEY or pass api_key")
 
@@ -387,7 +475,7 @@ def run_ingest(
 
     # Parallel LLM extraction
     def process_chunk(chunk):
-        return _call_llm(chunk, model, api_key, existing_titles=existing_titles_list)
+        return _call_llm(chunk, model, api_key, existing_titles=existing_titles_list, base_url=base_url)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_chunk, c): c for c in chunks}

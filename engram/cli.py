@@ -497,7 +497,7 @@ def synthesize(ctx, days, json_output, api_key):
 
     def llm_call(prompt: str) -> str:
         if provider == "anthropic" and not base_url:
-            import anthropic
+            import anthropic  # optional: pip install engram[anthropic]
             client = anthropic.Anthropic(api_key=resolved_key)
             msg = client.messages.create(
                 model=model,

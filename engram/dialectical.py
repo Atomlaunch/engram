@@ -123,9 +123,9 @@ RECENT SESSIONS:
 
 OUTPUT: Valid JSON only. No markdown fences. No explanation.
 
-{
+{{
   "new_facts": [
-    {
+    {{
       "title": "short descriptive title",
       "content": "the fact itself, one clear statement",
       "artifact_type": "durable_fact|preference|decision|lesson|constraint",
@@ -133,26 +133,26 @@ OUTPUT: Valid JSON only. No markdown fences. No explanation.
       "importance": 0.0-1.0,
       "about": ["Entity Name"],
       "tags": ["tag1"]
-    }
+    }}
   ],
   "updated_facts": [
-    {
+    {{
       "title": "title of existing fact",
       "update": "what changed or the new information to append",
       "reason": "why this update is needed"
-    }
+    }}
   ],
   "new_entities": [
-    {
+    {{
       "name": "Entity Name",
       "entity_type": "person|project|tool|concept|place|org",
       "description": "brief description",
       "importance": 0.0-1.0,
       "tags": ["tag1"]
-    }
+    }}
   ],
   "synthesis": "1-2 sentence summary of what was learned from these sessions"
-}
+}}
 
 RULES:
 - Only extract facts worth keeping months from now
